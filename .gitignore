@@ -1,14 +1,12 @@
-legacy/training/scripts
+training/scripts
 
-legacy/training/SlimPajama/
+training/SlimPajama/
 
-legacy/training/SlimPajama-finetune/
+training/SlimPajama-finetune/
 
-legacy/training/output_fla/
+training/wandb/
 
-legacy/training/wandb/
-
-legacy/training/configs/*.yaml
+training/configs/*.yaml
 
 eval_results/
 
