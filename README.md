@@ -24,7 +24,7 @@ Modify the configuration file (e.g., [nha_340M.json](training/configs/nha_340M.j
 ### 3. Run Training
 Set the `model` argument to the configuration file and run:
 ```bash
-cd legacy/training
+cd training
 
 bash train.sh \
   node=2 \
