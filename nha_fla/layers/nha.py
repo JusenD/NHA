@@ -374,9 +374,6 @@ class NativeHybridAttention(nn.Module):
 
         return o, None, past_key_values
 
-    def state_size(self, *args, **kwargs) -> int:
-        return 2 * self.num_slots * self.hidden_size
-
     def naive_swa(self, q: torch.Tensor, k: torch.Tensor, W: int):
         seq_len = q.shape[1]
         i = torch.arange(seq_len, device=q.device).view(-1, 1)  # (T, 1)
