@@ -2,6 +2,17 @@
 
 🎉 Welcome to NHA! This repository provides the implementation of *NHA: Native Hybrid Attention*. We include scripts for training, hybridization with pretrained LLMs, and evaluation.
 
+## 📦 Installation
+
+Create a new virtual environment and install the package from source:
+```bash
+conda create -n nha python=3.10
+conda activate nha
+
+pip install -e .
+```
+This will install all required dependencies.
+
 ## 🚀 Train
 
 ### 1. Prepare Datasets
