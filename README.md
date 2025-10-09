@@ -1,6 +1,12 @@
-# NHA: Native Hybrid Attention
+<div align="center">
 
-🎉 Welcome to NHA! This repository provides the implementation of *NHA: Native Hybrid Attention*. We include scripts for training, hybridization with pretrained LLMs, and evaluation.
+# Native Hybrid Attention for Efficient Sequence Modeling
+[![arXiv](https://img.shields.io/badge/Arxiv-2510.07019-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2510.07019)
+[![stars](https://img.shields.io/github/stars/JusenD/NHA)](https://github.com/JusenD/NHA/stargazers)
+
+</div>
+
+🎉 Welcome to NHA! This repository provides the implementation of [Native Hybrid Attention for Efficient Sequence Modeling](https://arxiv.org/abs/2510.07019). We include scripts for training, hybridization with pretrained LLMs, and evaluation.
 
 ## 📦 Installation
 
