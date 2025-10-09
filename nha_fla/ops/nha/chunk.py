@@ -1450,7 +1450,6 @@ def chunk_nha_fwd(
 
     qv = mix_p[:,:,:,:ok.shape[-1]].to(q.dtype).clone()
     sliding_window_prob = mix_p[:,:,:,ok.shape[-1]:].to(q.dtype).clone()
-    # sliding_window_prob = softmax_fwd(sliding_window, dtype=torch.float).to(q.dtype)
 
     Av, hv, hvt, ov = chunk_nha_fwd_v(
         q=qv,
@@ -1575,10 +1574,6 @@ def chunk_nha_bwd(
     dg = torch.cat([dg, shift_g], dim=1)
 
     dv = dv.add_(dswa_v)
-    # dq = dq.add_(dswa_q)
-    # dk = dk.add_(dswa_k)
-    # if q.shape[1] != k.shape[1]:
-    #     dk, dv, ds, dg = map(lambda x: reduce(x, 'b (h g) ... -> b h ...', 'sum', h=k.shape[1]), (dk, dv, ds, dg))
     dg = dg.to(s.dtype)
     return dq, dk, dv, dswa_q, dswa_k, ds, dg, dhk0, dhv0
 

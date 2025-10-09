@@ -11,6 +11,8 @@ from setuptools import find_packages, setup
 setup(
     name='nha_fla',
     description='Implementations of Native Hybrid Attention',
+    author='Jusen Du',
+    author_email='dujusen@gmail.com',
     packages=find_packages(),
     license='MIT',
     classifiers=[
