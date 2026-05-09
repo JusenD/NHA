@@ -174,8 +174,9 @@ class NativeHybridAttention(nn.Module):
             mode = self.mode
 
         cu_seqlens = kwargs.get('cu_seqlens')
+        max_seqlen = kwargs.get('max_seqlen')
         if attention_mask is not None:
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            indices, cu_seqlens, max_seqlen = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)     
 
         if self.use_short_conv:
@@ -244,6 +245,7 @@ class NativeHybridAttention(nn.Module):
                 head_first=False,
                 gsa_kv_shift=self.gsa_kv_shift,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
 
             # aux loss

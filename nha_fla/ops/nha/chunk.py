@@ -548,12 +548,12 @@ def chunk_nha(
 
     is_varlen = cu_seqlens is not None
 
+    assert q_swa.dim() == 4, "Expected [B, T, H, D] for input"
+    B, T, H, D = q_swa.shape
+    M = s.shape[-1]
+    
     if not is_varlen:
         # Batched mode: flatten to varlen
-        assert q_swa.dim() == 4, "Expected [B, T, H, D] for non-varlen mode"
-        B, T, H, D = q_swa.shape
-        M = s.shape[-1]
-
         # Build cu_seqlens
         cu_seqlens = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=q_swa.device)
         max_seqlen = T
