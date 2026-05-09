@@ -57,17 +57,26 @@ class NHABlock(nn.Module):
                 num_heads=config.num_heads,
                 num_kv_heads=config.num_kv_heads,
                 num_slots=config.num_slots,
+                elementwise_affine=config.elementwise_affine,
+                norm_eps=config.norm_eps,
                 use_short_conv=config.use_short_conv,
                 conv_size=config.conv_size,
+                conv_bias=config.conv_bias,
                 feature_map=config.feature_map,
                 use_output_gate=config.use_output_gate,
                 use_norm=config.use_norm,
-                gate_fn=config.hidden_act,
                 gate_logit_normalizer=config.gate_logit_normalizer,
                 elementwise_affine=config.elementwise_affine,
                 norm_eps=config.norm_eps,
                 fuse_norm=config.fuse_norm,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
+                window_size=config.window_size,
+                rope_theta=config.rope_theta,
+                max_position_embeddings=config.max_position_embeddings,
+                gsa_aux_loss_enable=config.gsa_aux_loss_enable,
+                gsa_aux_loss_coeff=config.gsa_aux_loss_coeff,
+                gsa_aux_loss_target_ratio=config.gsa_aux_loss_target_ratio,
+                gsa_kv_shift=config.gsa_kv_shift,
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = NHAMLP(
@@ -125,7 +134,7 @@ class NHAPreTrainedModel(PreTrainedModel):
     def _init_weights(
         self,
         module: nn.Module,
-        prenorm_residual_strategy: Optional[str] = 'rescale',
+        prenorm_residual_strategy: str | None = None,
         num_residuals_per_layer: int = 2,
     ):
         if isinstance(module, (nn.Linear, nn.Conv1d)):

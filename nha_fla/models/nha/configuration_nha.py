@@ -14,8 +14,6 @@ class NHAConfig(PretrainedConfig):
         self,
         hidden_size: int = 2048,
         gate_logit_normalizer: Optional[int] = 8,
-        clamp_min: Optional[float] = None,
-        clamp_max: Optional[float] = None,
         hidden_ratio: Optional[int] = 4,
         intermediate_size: Optional[int] = None,
         num_hidden_layers: int = 24,
@@ -24,12 +22,13 @@ class NHAConfig(PretrainedConfig):
         num_slots: Optional[int] = 64,
         use_short_conv: bool = False,
         conv_size: int = 4,
+        conv_bias: bool = False,
         exapnd_k: float = 1,
         exapnd_v: float = 1,
         feature_map: str = 'swish',
         use_output_gate: bool = False,
         use_norm: bool = True,
-        max_position_embeddings: int = 2048,
+        max_position_embeddings: int = 4096,
         hidden_act: str = "swish",
         elementwise_affine: Optional[bool] = True,
         norm_first: bool = True,
@@ -48,15 +47,16 @@ class NHAConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,
         window_size: int = 32,
-        block_size: Optional[int] = None,
         transformer_idx: Optional[int] = None,
         rand_window: bool = False,
+        gsa_aux_loss_enable: bool = False,
+        gsa_aux_loss_coeff: float | None = None,
+        gsa_aux_loss_target_ratio: float = 1.0,
+        gsa_kv_shift: int = 0,
         **kwargs
     ):
         self.hidden_size = hidden_size
         self.gate_logit_normalizer = gate_logit_normalizer
-        self.clamp_min = clamp_min
-        self.clamp_max = clamp_max
         self.hidden_ratio = hidden_ratio
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
@@ -65,6 +65,7 @@ class NHAConfig(PretrainedConfig):
         self.num_slots = num_slots
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
+        self.conv_bias = conv_bias
         self.expand_k = exapnd_k
         self.expand_v = exapnd_v
         self.feature_map = feature_map
@@ -89,9 +90,12 @@ class NHAConfig(PretrainedConfig):
         self.num_attention_heads = num_heads
 
         self.window_size = window_size
-        self.block_size = block_size
         self.transformer_idx = transformer_idx
         self.rand_window = rand_window
+        self.gsa_aux_loss_enable = gsa_aux_loss_enable
+        self.gsa_aux_loss_coeff = gsa_aux_loss_coeff
+        self.gsa_aux_loss_target_ratio = gsa_aux_loss_target_ratio
+        self.gsa_kv_shift = gsa_kv_shift
 
         if attn is not None:
             if not isinstance(attn, Dict):

@@ -1,71 +1,61 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2024, Songlin Yang, Yu Zhang
+# Copyright (c) 2024-2026, Jusen Du, Songlin Yang, Yu Zhang
 
 from __future__ import annotations
 
-import math
-import time
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 
-from nha_fla.models.nha.configuration_nha import NHAConfig
-from fla.modules import RMSNorm, ShortConvolution
-from fla.modules.activations import swish
-from fla.modules.feature_map import (ReLUFeatureMap, SwishFeatureMap,
-                                     T2RFeatureMap)
+from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
+from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
+from fla.modules.feature_map import ReLUFeatureMap, SwishFeatureMap, T2RFeatureMap
 from fla.modules.layernorm import rms_norm_linear
 from nha_fla.ops.nha import chunk_nha, fused_recurrent_nha
-from fla.modules import RotaryEmbedding
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
-    from fla.models.nha_cache import NHACache
-from math import ceil
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-except ImportError:
-    warnings.warn(
-        "Flash Attention is not installed. Please install it via `pip install flash-attn --no-build-isolation`",
-        category=ImportWarning
-    )
-    flash_attn_func = None
+    from nha_fla.models.nha_cache import NHACache
 
 
 class NativeHybridAttention(nn.Module):
 
     def __init__(
         self,
-        config: NHAConfig,
         mode: str = 'chunk',
         hidden_size: int = 1024,
         expand_k: float = 1.,
         expand_v: float = 1.,
         num_heads: int = 4,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
-        num_slots: Optional[int] = None,
-        rope_theta: Optional[float] = 10000.,
-        max_position_embeddings: Optional[int] = None,
-        elementwise_affine: Optional[bool] = True,
+        num_slots: int | None = None,
+        elementwise_affine: bool | None = True,
         norm_eps: float = 1e-5,
         gate_logit_normalizer: int = 8,
         feature_map: str = 'swish',
         use_output_gate: bool = False,
         use_norm: bool = True,
-        layer_idx: Optional[int] = None,
-        scale: Optional[float] = 1.,
-        **kwargs
+        fuse_norm: bool = True,
+        layer_idx: int | None = None,
+        scale: float | None = 1.,
+        window_size: int = 2048,
+        rope_theta: float = 10000.,
+        max_position_embeddings: int | None = None,
+        gsa_aux_loss_enable: bool = False,
+        gsa_aux_loss_coeff: float | None = None,
+        gsa_aux_loss_target_ratio: float = 1.0,
+        gsa_kv_shift: int = 0,
+        **kwargs,
     ) -> NativeHybridAttention:
         super().__init__()
-        self.config = config
+
         self.mode = mode
         self.hidden_size = hidden_size
         self.expand_k = expand_k
@@ -88,15 +78,21 @@ class NativeHybridAttention(nn.Module):
 
         self.use_output_gate = use_output_gate
         self.use_norm = use_norm
+        self.fuse_norm = fuse_norm
         self.scale = scale
+
+        self.window_size = window_size
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.gsa_aux_loss_enable = gsa_aux_loss_enable
+        self.gsa_aux_loss_coeff = gsa_aux_loss_coeff
+        self.gsa_aux_loss_target_ratio = gsa_aux_loss_target_ratio
+        self.gsa_kv_shift = gsa_kv_shift
 
         if num_slots is None:
             num_slots = self.head_k_dim
         self.num_slots = num_slots
-
-        self.window_size = config.window_size
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
 
         self.layer_idx = layer_idx
 
@@ -104,7 +100,7 @@ class NativeHybridAttention(nn.Module):
             warnings.warn(
                 f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
+                "when creating this class.",
             )
 
         self.register_module('feature_map', None)
@@ -124,51 +120,39 @@ class NativeHybridAttention(nn.Module):
 
         if use_short_conv:
             self.conv_size = conv_size
-            self.q_conv1d = ShortConvolution(self.key_dim, conv_size, activation='silu')
-            self.k_conv1d = ShortConvolution(self.key_dim_per_group, conv_size, activation='silu')
-            self.v_conv1d = ShortConvolution(self.value_dim_per_group, conv_size, activation='silu')
+            self.q_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation='silu',
+            )
+            self.k_conv1d = ShortConvolution(
+                hidden_size=self.key_dim_per_group,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation='silu',
+            )
+            self.v_conv1d = ShortConvolution(
+                hidden_size=self.value_dim_per_group,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation='silu',
+            )
 
-        self.g_norm = RMSNorm(self.hidden_size, elementwise_affine, eps=norm_eps)
+        self.g_norm = RMSNorm(self.hidden_size, elementwise_affine, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=self.rope_theta)
 
-        self.learnable_init_slots = False
-        if self.learnable_init_slots:
-            # TODO: parameter effient, maybe only add learnable hidden state and generate k, v, f
-            self.init_slot_k = nn.Parameter(torch.empty(self.window_size, self.num_heads, self.head_k_dim))
-            self.init_slot_v = nn.Parameter(torch.empty(self.window_size, self.num_heads, self.head_v_dim))
-            self.init_slot_f = nn.Parameter(torch.empty(self.window_size, self.num_heads, self.num_slots))
-            nn.init.constant_(self.init_slot_k, 0)
-            nn.init.constant_(self.init_slot_v, 0)
-            nn.init.constant_(self.init_slot_f, 0)
-
-        if config.block_size is not None and config.transformer_idx is not None:
-            if self.layer_idx % config.block_size == config.transformer_idx:
-                self.window_size = 2048
-            else:
-                self.window_size = config.window_size
-        
-
-    def _initialize_weights(self, module: nn.Module):
-        if getattr(module, "_is_hf_initialized", False):
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=2 ** -2.5)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        module._is_hf_initialized = True
-
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[NHACache] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        **kwargs: Unpack[Dict]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[NHACache]]:
-
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: NHACache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, NHACache | None]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -176,188 +160,143 @@ class NativeHybridAttention(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
 
-        # launching the triton kernel for just one token will actually be slower
-        mode = 'fused_recurrent' if hidden_states.shape[1] == 1 else self.mode
+        batch_size, q_len, _ = hidden_states.shape
 
         last_state = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
+        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
+
+        if q_len == 1 and last_state is not None:
+            mode = 'fused_recurrent'
+        else:
+            mode = self.mode
+
+        cu_seqlens = kwargs.get('cu_seqlens')
+        if attention_mask is not None:
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)     
+
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
-            conv_mask = attention_mask[:, -hidden_states.shape[1]:] if attention_mask is not None else None
-            position_ids = kwargs.get('position_ids', None)
-            q, conv_state_q = self.q_conv1d(x=self.q_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_q,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
-            k, conv_state_k = self.k_conv1d(x=self.k_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_k,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
-            v, conv_state_v = self.v_conv1d(x=self.v_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_v,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
+            q, conv_state_q = self.q_conv1d(
+                x=self.q_proj(hidden_states),
+                cache=conv_state_q,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            k, conv_state_k = self.k_conv1d(
+                x=self.k_proj(hidden_states),
+                cache=conv_state_k,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            v, conv_state_v = self.v_conv1d(
+                x=self.v_proj(hidden_states),
+                cache=conv_state_v,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
         else:
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
         f = self.f_proj(hidden_states)
 
-        q = rearrange(q, 'b t (h d) -> b t h d', d=self.head_k_dim)
-        k = rearrange(k, 'b t (h d) -> b t h d', d=self.head_k_dim)
-        v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_v_dim)
-        f = rearrange(f, 'b t (h m) -> b t h m', m=self.num_slots)
+        q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
+        k = rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim)
+        v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+        f = rearrange(f, '... (h m) -> ... h m', m=self.num_slots)
 
-        # if self.feature_map is not None:
-        #     q, k = map(lambda x: self.feature_map(x), (q, k))
+        if self.feature_map is not None:
+            q_gsa, k_gsa = map(lambda x: self.feature_map(x), (q, k))
+        else:
+            q_gsa, k_gsa = q, k
         v = F.silu(v)
 
         f = F.logsigmoid(f) / self.gate_logit_normalizer
         s = (1 - f.exp()).to(f.dtype)
-        
-        seqlen_offset, max_seqlen = 0, q.shape[1]
+        g = f
 
-        # dealing with left-padding
-        if attention_mask is not None:
-            s = s.mul_(attention_mask[:, -s.shape[1]:, None, None])
-            v = v.mul_(attention_mask[:, -v.shape[1]:, None, None])
+        if self.num_kv_groups > 1:
+            k, v, k_gsa, s, g = map(lambda x: repeat(x, '... h d -> ... (h g) d', g=self.num_kv_groups), (k, v, k_gsa, s, g))
 
-        if past_key_values is not None:
-            # prepare gsa input
-            last_k, last_v, last_f = past_key_values.get_pop_kvf(self.layer_idx, self.window_size)
-            
-            if last_k is None:
-                if self.learnable_init_slots and seqlen_offset[0] != 0:
-                    last_k = self.init_slot_k[None, seqlen_offset:seqlen_offset+q.shape[1], ...]
-                    last_v = self.init_slot_v[None, seqlen_offset:seqlen_offset+q.shape[1], ...]
-                    last_f = self.init_slot_f[None, seqlen_offset:seqlen_offset+q.shape[1], ...]
-                    last_s = (1 - last_f.exp()).to(last_f.dtype)
-                else:
-                    b, _, h, d_k, d_v = *q.shape, v.shape[-1]
-                    last_k, last_v, last_f = torch.zeros((b, 1, h, d_k), dtype=k.dtype, device=k.device), \
-                                                torch.zeros((b, 1, h, d_v), dtype=v.dtype, device=v.device), \
-                                                torch.zeros((b, 1, h, self.num_slots), dtype=f.dtype, device=f.device)
-                    last_s = last_f
-            
+        seqlen_offset = 0
+        if last_state is not None and 'seqlen_offset' in last_state:
+            seqlen_offset = last_state['seqlen_offset']
+        q_swa, k_swa = self.rotary(q, k, seqlen_offset=seqlen_offset)
+
+        if mode == 'chunk':
+            output, lse_swa, lse_gsa = chunk_nha(
+                q_swa=q_swa,
+                k_swa=k_swa,
+                q_gsa=q_gsa,
+                k_gsa=k_gsa,
+                v=v,
+                s=s,
+                g=g,
+                scale=self.scale,
+                window_size_left=self.window_size,
+                window_size_right=0,
+                head_first=False,
+                gsa_kv_shift=self.gsa_kv_shift,
+                cu_seqlens=cu_seqlens,
+            )
+
+            # aux loss
+            if self.training:
+                lse_max = torch.maximum(lse_swa, lse_gsa)
+                w_swa = torch.exp(lse_swa - lse_max)
+                w_gsa = torch.exp(lse_gsa - lse_max)
+                self._store_compression_stats(w_swa, w_gsa)
+
+                if self.gsa_aux_loss_enable:
+                    output, gsa_aux_loss = self._apply_gsa_aux_loss(output, lse_swa, lse_gsa)
+                    self._store_gsa_aux_loss(gsa_aux_loss)
+
+        elif mode == 'fused_recurrent':
+            from nha_fla.ops.nha.fused_recurrent import fused_recurrent_nha_step
+
+            if recurrent_state is not None:
+                hk0, hv0 = recurrent_state
             else:
-                last_k = rearrange(last_k, '... (h d) -> ... h d', h=self.num_heads)
-                last_v = rearrange(last_v, '... (h d) -> ... h d', h=self.num_heads)
-                last_f = rearrange(last_f, '... (h d) -> ... h d', h=self.num_heads)
-                last_s = (1 - last_f.exp()).to(last_f.dtype)
+                H_kv = self.num_kv_heads * self.num_kv_groups
+                hk0 = q.new_zeros(batch_size, H_kv, self.head_k_dim, self.num_slots)
+                hv0 = q.new_zeros(batch_size, H_kv, self.num_slots, self.head_v_dim)
 
-            # update swa cache
-            k_cached, v_cached, f_cached = past_key_values.update(
-                attn_state=(k.flatten(-2, -1), v.flatten(-2, -1), f.flatten(-2, -1)),
-                layer_idx=self.layer_idx,
-                offset=0,
-                cache_kwargs=dict(window_size=self.window_size)
-            )['attn_state']
-            cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
-            if cache_has_content:
-                k, v = k_cached, v_cached
-                k = rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim)
-                v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+            output_gsa, hk_new, hv_new = fused_recurrent_nha_step(
+                q=rearrange(q_gsa, 'b t h d -> (b t) h d'),
+                k=rearrange(k_gsa, 'b t h d -> (b t) h d'),
+                v=rearrange(v, 'b t h d -> (b t) h d'),
+                s=rearrange(s, 'b t h m -> (b t) h m'),
+                g=rearrange(g, 'b t h m -> (b t) h m'),
+                hk=hk0,
+                hv=hv0,
+                scale=self.scale,
+            )
+            output_gsa = rearrange(output_gsa, '(b t) h d -> b t h d', b=batch_size)
 
-            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = q.shape[1] + seqlen_offset
-
-        cu_seqlens = kwargs.get('cu_seqlens', None)
-
-        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        if mode == 'fused_recurrent':
-            pad_len = max(max_seqlen, 2048)
-            offset_int = seqlen_offset
-            q_offset = seqlen_offset
-            pad_q, pad_k = torch.zeros((q.shape[0], pad_len, q.shape[2], q.shape[3]), dtype=q.dtype, device=q.device), torch.zeros((k.shape[0], pad_len, k.shape[2], k.shape[3]), dtype=k.dtype, device=k.device)
-            pad_q[:, q_offset:q_offset+1, :, :] = q
-            pad_k[:, offset_int-k.shape[1]+1:offset_int+1, :, :] = k
-            pad_q, pad_k = self.rotary(pad_q.clone(), pad_k.clone(), seqlen_offset=0, max_seqlen=8192, cu_seqlens=cu_seqlens)
-            rotary_q = pad_q[:, q_offset:q_offset+1, :, :].clone()
-            rotary_k = pad_k[:, offset_int-k.shape[1]+1:offset_int+1, :, :].clone()
-            if self.window_size <= 64:
-                sliding_window = self.naive_swa(rotary_q, rotary_k, self.window_size)
-                shift_k, shift_v, shift_f, shift_s = last_k, last_v, last_f, last_s
-                
-                o, sliding_window_prob, recurrent_state = fused_recurrent_nha(
-                    q=q,
-                    k=shift_k,
-                    v=shift_v,
-                    sliding_window=sliding_window,
-                    s=shift_s,
-                    g=shift_f,
-                    initial_state=recurrent_state,
-                    output_final_state=use_cache,
-                    scale=None,
-                    cu_seqlens=cu_seqlens,
-                    head_first=False,
+            try:
+                from flash_attn import flash_attn_func
+                output_swa = flash_attn_func(
+                    q_swa, k_swa, v,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=(self.window_size, 0),
                 )
-                o += torch.einsum('bthw,bwhd->bthd',
-                                    sliding_window_prob.to(v.dtype),
-                                    v)
-            else:
-                prefix_k = torch.zeros(k.size(0), self.num_slots, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
-                prefix_v = torch.zeros(v.size(0), self.num_slots, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
-                shift_k = torch.cat([prefix_k, rotary_k], dim=1)
-                shift_v = torch.cat([prefix_v, v], dim=1)
-                sliding_window = self.naive_swa(rotary_q, shift_k, self.window_size)
-                sliding_window_prob = sliding_window.softmax(-1)
-                o = torch.einsum('bthw,bwhd->bthd',
-                                sliding_window_prob,
-                                shift_v)
-        elif mode == 'chunk':
-            if self.window_size <= 64:
+            except ImportError:
+                scale = self.scale or self.head_k_dim ** -0.5
+                attn = torch.einsum('bthd,bshd->bths', q_swa * scale, k_swa)
+                causal_mask = torch.ones(q_len, q_len, dtype=torch.bool, device=attn.device).tril()
+                attn = attn.masked_fill(~causal_mask, float('-inf'))
+                attn = F.softmax(attn, dim=-1)
+                output_swa = torch.einsum('bths,bshd->bthd', attn, v)
 
-                rotary_q, rotary_k = self.rotary(q, k, seqlen_offset=0, max_seqlen=8192, cu_seqlens=cu_seqlens)
-
-                prefix_k = torch.zeros(k.size(0), self.window_size, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
-                prefix_v = torch.zeros(v.size(0), self.window_size, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
-                prefix_s = torch.zeros(s.size(0), self.window_size, s.size(2), s.size(3), dtype=s.dtype, device=s.device)
-                prefix_f = torch.zeros(f.size(0), self.window_size, f.size(2), f.size(3), dtype=f.dtype, device=f.device)
-
-                shift_k = torch.cat([prefix_k, k], dim=1)
-                shift_v = torch.cat([prefix_v, v], dim=1)
-                shift_s = torch.cat([prefix_s, s], dim=1)
-                shift_f = torch.cat([prefix_f, f], dim=1)
-
-                rotary_k = torch.cat([prefix_k, rotary_k], dim=1)
-
-                o, recurrent_state = chunk_nha(
-                    q=q,
-                    k=shift_k,
-                    v=shift_v,
-                    rotary_q=rotary_q,
-                    rotary_k=rotary_k,
-                    window_size=self.window_size,
-                    s=shift_s,
-                    g=shift_f,
-                    initial_state=recurrent_state,
-                    output_final_state=use_cache,
-                    scale=None,
-                    cu_seqlens=cu_seqlens,
-                    head_first=False,
-                    rotary=self.rotary,
-                )
-            else:
-                rotary_q, rotary_k = self.rotary(q, k, seqlen_offset=0, max_seqlen=8192, cu_seqlens=cu_seqlens)
-                prefix_k = torch.zeros(k.size(0), self.num_slots, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
-                prefix_v = torch.zeros(v.size(0), self.num_slots, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
-                shift_q = torch.cat([prefix_k, rotary_q], dim=1)
-                shift_k = torch.cat([prefix_k, rotary_k], dim=1)
-                shift_v = torch.cat([prefix_v, v], dim=1)
-
-                sliding_window = self.naive_swa(shift_q, shift_k, self.window_size)
-                sliding_window_prob = sliding_window.softmax(-1)
-                o = torch.einsum('bthw,bwhd->bthd',
-                                sliding_window_prob,
-                                shift_v)
-                o = o[:, self.num_slots:, :, :]
+            output = 0.5 * output_swa + 0.5 * output_gsa
+            recurrent_state = (hk_new, hv_new)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
@@ -366,26 +305,73 @@ class NativeHybridAttention(nn.Module):
                 recurrent_state=recurrent_state,
                 conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
                 layer_idx=self.layer_idx,
-                offset=q.shape[1]
+                offset=q_len,
             )
 
-        o = rearrange(o, 'b t h d -> b t (h d)')
+        o = rearrange(output[:, :, :, :self.head_v_dim], '... h d -> ... (h d)')
         o = rms_norm_linear(F.silu(o), self.g_norm.weight, self.g_norm.bias, self.o_proj.weight, self.o_proj.bias)
+        if attention_mask is not None:
+            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
 
-    def naive_swa(self, q: torch.Tensor, k: torch.Tensor, W: int):
-        seq_len = q.shape[1]
-        i = torch.arange(seq_len, device=q.device).view(-1, 1)  # (T, 1)
-        j = torch.arange(seq_len, device=q.device).view(1, -1)  # (1, T)
-        
-        left_bound = torch.clamp(i - W + 1, min=0)          # (T, 1)
-        
-        valid_mask = (j >= left_bound) & (j <= i)                    # (T, T)
+    # ----------------------------------------------------------------
+    # Aux loss helpers
+    # ----------------------------------------------------------------
 
-        scale_factor = 1 / (q.shape[-1] ** 0.5)
-        qk = torch.einsum('bthd,bnhd->bhtn', q, k) * scale_factor
+    @torch.no_grad()
+    def _store_compression_stats(self, w_swa: torch.Tensor, w_gsa: torch.Tensor):
+        """Store GSA vs SWA ratio for monitoring."""
+        w_sum = w_swa + w_gsa
+        gsa_ratio = (w_gsa / w_sum).mean().item()
+        if not hasattr(self, '_compression_stats'):
+            self._compression_stats = []
+        self._compression_stats.append({
+            'gsa_ratio': gsa_ratio,
+            'swa_ratio': 1.0 - gsa_ratio,
+        })
 
-        qk = qk.masked_fill(~valid_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+    def _apply_gsa_aux_loss(
+        self,
+        output: torch.Tensor,
+        lse_swa: torch.Tensor,
+        lse_gsa: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply single-side GSA aux loss via lse_gsa.
 
-        return qk.transpose(1, 2)
+        Uses SWA as stop-grad baseline (SWA LSE may not support backward).
+        """
+        gsa_logits_delta = lse_gsa.float() - lse_swa.detach().float()
+        gsa_target = torch.full_like(gsa_logits_delta, self.gsa_aux_loss_target_ratio)
+        gsa_aux_loss = F.binary_cross_entropy_with_logits(
+            gsa_logits_delta, gsa_target, reduction='mean'
+        )
+        output = _EnableCoeffGrad.apply(output, gsa_aux_loss, self.gsa_aux_loss_coeff)
+        return output, gsa_aux_loss
+
+    @torch.no_grad()
+    def _store_gsa_aux_loss(self, gsa_aux_loss: torch.Tensor):
+        """Store aux loss value for monitoring."""
+        if not hasattr(self, '_gsa_aux_losses'):
+            self._gsa_aux_losses = []
+        self._gsa_aux_losses.append(gsa_aux_loss.item())
+
+
+class _EnableCoeffGrad(torch.autograd.Function):
+    """Attach an aux-loss gradient to the output hidden states."""
+
+    @staticmethod
+    def forward(ctx, hidden: torch.Tensor, loss: torch.Tensor, coeff: float | None):
+        ctx.save_for_backward(loss)
+        ctx.coeff = coeff
+        return hidden
+
+    @staticmethod
+    def backward(ctx, *grads):
+        dhidden = grads[0]
+        coeff = ctx.coeff
+        loss: torch.Tensor = ctx.saved_tensors[0]
+        if coeff is None or coeff == 0.0:
+            return dhidden, None, None
+        dloss = torch.full((1,), coeff, dtype=loss.dtype, device=loss.device)
+        return dhidden, dloss, None

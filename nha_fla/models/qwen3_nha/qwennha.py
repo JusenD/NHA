@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .configuration_qwen3_nha import Qwen3NHAConfig
-from nha_fla.ops.nha import chunk_nha, fused_recurrent_nha
+from nha_fla.ops.nha_naive import chunk_nha, fused_recurrent_nha
 
 from nha_fla.models.nha_cache import NHACache
 
