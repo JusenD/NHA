@@ -97,26 +97,30 @@ def fused_recurrent_nha_inference_k_kernel(
     scale,
     K: tl.constexpr,
     M: tl.constexpr,
+    MS: tl.constexpr,
     BK: tl.constexpr,
     NG: tl.constexpr
 ):
     i_bh = tl.program_id(0)
     i_bg = i_bh // NG
 
-    b_s = tl.load(s + i_bg * M + tl.arange(0, M)).to(tl.float32)
-    b_g = tl.load(g + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    o_m = tl.arange(0, MS)
+    mask_m = o_m < M
+
+    b_s = tl.load(s + i_bg * M + o_m, mask=mask_m, other=0.).to(tl.float32)
+    b_g = tl.load(g + i_bg * M + o_m, mask=mask_m, other=0.).to(tl.float32)
     b_g = exp(b_g)
 
-    b_ok = tl.zeros([M], dtype=tl.float32)
+    b_ok = tl.zeros([MS], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
 
-        p_hk0 = hk0 + i_bg * K * M + (o_k[None, :]) * M + tl.arange(0, M)[:, None]
+        p_hk0 = hk0 + i_bg * K * M + (o_k[None, :]) * M + o_m[:, None]
         # [BK,]
         mask_k = o_k < K
-        # [M, BK]
-        mask_hk = (tl.arange(0, M) < M)[:, None] & mask_k[None, :]
-        # [M, BK]
+        # [MS, BK]
+        mask_hk = mask_m[:, None] & mask_k[None, :]
+        # [MS, BK]
         b_hk = tl.load(p_hk0, mask=mask_hk, other=0.).to(tl.float32)
         # [BK,]
         b_q = tl.load(q + i_bh * K + o_k, mask=mask_k, other=0.).to(tl.float32) * scale
@@ -125,10 +129,12 @@ def fused_recurrent_nha_inference_k_kernel(
         b_ok += tl.sum(b_hk * b_q[None, :], axis=1)
 
         if i_bh % NG == 0:
-            p_hkt = hkt + i_bg * K * M + o_k[None, :] * M + tl.arange(0, M)[:, None]
+            p_hkt = hkt + i_bg * K * M + o_k[None, :] * M + o_m[:, None]
             tl.store(p_hkt, b_hk.to(p_hkt.dtype.element_ty), mask=mask_hk)
-    
-    tl.store(out_b_ok + i_bg * M + tl.arange(0, M), b_ok.to(out_b_ok.dtype.element_ty))
+
+    # per-query-head slot scores: every program owns row i_bh exactly once,
+    # so all B*HQ rows are written with no cross-program race
+    tl.store(out_b_ok + i_bh * M + o_m, b_ok.to(out_b_ok.dtype.element_ty), mask=mask_m)
 
 @triton.jit
 def fused_recurrent_nha_inference_v_kernel(
@@ -139,29 +145,36 @@ def fused_recurrent_nha_inference_v_kernel(
     o,
     hv0,
     hvt,
+    sqv,
     V: tl.constexpr,
     M: tl.constexpr,
+    MS: tl.constexpr,
     BV: tl.constexpr,
     NG: tl.constexpr
 ):
     i_bh = tl.program_id(0)
     i_bg = i_bh // NG
 
-    b_s = tl.load(s + i_bg * M + tl.arange(0, M)).to(tl.float32)
-    b_g = tl.load(g + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    o_m = tl.arange(0, MS)
+    mask_m = o_m < M
+
+    b_s = tl.load(s + i_bg * M + o_m, mask=mask_m, other=0.).to(tl.float32)
+    b_g = tl.load(g + i_bg * M + o_m, mask=mask_m, other=0.).to(tl.float32)
     b_g = exp(b_g)
 
-    b_qv = tl.load(qv + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    # per-query-head slot probabilities, matching the k-kernel's per-head store;
+    # sqv is the row stride of qv (it may be a last-dim slice of the softmax output)
+    b_qv = tl.load(qv + i_bh * sqv + o_m, mask=mask_m, other=0.).to(tl.float32)
 
     for i_v in range(tl.cdiv(V, BV)):
         o_v = i_v * BV + tl.arange(0, BV)
 
-        p_hv0 = hv0 + i_bg * M * V + tl.arange(0, M)[None, :] * V + o_v[:, None]
+        p_hv0 = hv0 + i_bg * M * V + o_m[None, :] * V + o_v[:, None]
         # [BV,]
         mask_v = o_v < V
-        # [BV, M]
-        mask_hv = mask_v[:, None] & (tl.arange(0, M) < M)[None, :]
-        # [BV, M]
+        # [BV, MS]
+        mask_hv = mask_v[:, None] & mask_m[None, :]
+        # [BV, MS]
         b_hv = tl.load(p_hv0, mask=mask_hv, other=0).to(tl.float32)
         # [BV,]
         b_v = tl.load(v + i_bg * V + o_v, mask=mask_v, other=0).to(tl.float32)
@@ -171,7 +184,7 @@ def fused_recurrent_nha_inference_v_kernel(
         tl.store(o + i_bh * V + o_v, b_ov.to(o.dtype.element_ty), mask=mask_v)
 
         if i_bh % NG == 0:
-            p_hvt = hvt + i_bg * M * V + tl.arange(0, M)[None, :] * V + o_v[:, None]
+            p_hvt = hvt + i_bg * M * V + o_m[None, :] * V + o_v[:, None]
             tl.store(p_hvt, b_hv.to(p_hvt.dtype.element_ty), mask=mask_hv)
 
 def fused_recurrent_nha_inference(
@@ -193,6 +206,7 @@ def fused_recurrent_nha_inference(
         B, T, H, K, V, M = *k.shape, v.shape[-1], s.shape[-1]
     HQ = q.shape[1] if head_first else q.shape[2]
     BK, BV = min(triton.next_power_of_2(K), 64), min(triton.next_power_of_2(V), 64)
+    MS = triton.next_power_of_2(M)
     NG = HQ // H
 
     if initial_state != (None, None) and initial_state is not None:
@@ -220,13 +234,16 @@ def fused_recurrent_nha_inference(
         scale=scale,
         K=K,
         M=M,
+        MS=MS,
         BK=BK,
         NG=NG
     )
 
     combined = torch.cat([ok, sliding_window], dim=-1)
     combined_scores = combined.softmax(dim=-1, dtype=torch.float32)
-    qv = combined_scores[..., :M].clone()
+    # a view into combined_scores: the v-kernel takes the row stride (sqv), so
+    # no contiguous copy is needed here
+    qv = combined_scores[..., :M]
     swa_score = combined_scores[..., M:].clone()
 
     o = v.new_empty(B, HQ, T, V) if head_first else v.new_empty(B, T, HQ, V)
@@ -238,8 +255,10 @@ def fused_recurrent_nha_inference(
         o,
         hv0,
         hvt,
+        qv.stride(-2),
         V=V,
         M=M,
+        MS=MS,
         BV=BV,
         NG=NG
     )
