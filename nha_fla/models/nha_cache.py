@@ -102,6 +102,13 @@ class NHACache(transformers.cache_utils.Cache):
             if attn_state is not None:
                 key_state, value_state, f_state = state['attn_state']
                 if window_size is not None and key_state.shape[-2] == window_size:
+                    # a chunk larger than the window replaces the whole
+                    # window; without this the cat below would grow the
+                    # cache past `window_size` and silently corrupt it
+                    if input_size > window_size:
+                        attn_state = (attn_state[0][..., -window_size:, :].contiguous(),
+                                      attn_state[1][..., -window_size:, :].contiguous(),
+                                      attn_state[2][..., -window_size:, :].contiguous())
                     # shift the window left by `input_size` and append the new
                     # key/value states (single cat kernel per tensor instead of
                     # roll + slice-assign)
@@ -184,6 +191,12 @@ class NHACache(transformers.cache_utils.Cache):
             if attn_state is not None:
                 key_state, value_state = state['attn_state']
                 if window_size is not None and key_state.shape[-2] == window_size:
+                    # a chunk larger than the window replaces the whole
+                    # window; without this the cat below would grow the
+                    # cache past `window_size` and silently corrupt it
+                    if input_size > window_size:
+                        attn_state = (attn_state[0][..., -window_size:, :].contiguous(),
+                                      attn_state[1][..., -window_size:, :].contiguous())
                     # shift the window left by `input_size` and append the new
                     # key/value states (single cat kernel per tensor instead of
                     # roll + slice-assign)

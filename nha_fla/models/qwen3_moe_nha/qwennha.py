@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .configuration_qwen3_moe_nha import Qwen3MoeNHAConfig
-from nha_fla.ops.nha_naive import chunk_nha, fused_recurrent_nha, fused_recurrent_nha_decode
+from nha_fla.ops.nha_naive import chunk_nha, fused_recurrent_nha_decode
 from nha_fla.ops.nha.chunk_fused import fused_chunk_nha_prefill
 
 from nha_fla.models.nha_cache import NHACache
@@ -228,7 +228,10 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                 sk = apply_rotary_pos_emb(k, k, cos, sin, unsqueeze_dim=2)[0]
                 cos = sin = None
         else:
-            k_rot = repeat_kv(k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+            # rotary targets: the kv-head keys for the fused prefill, the
+            # query-head-expanded keys everywhere else; skip the expansion
+            # entirely when only the fused path can consume it
+            k_rot = None if use_fused_prefill else repeat_kv(k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
 
             if position_embeddings is None:
                 logger.warning_once(
@@ -374,10 +377,26 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                     scale=None,
                 )
             else:
-                # decode with GQA-native flash-attn: sk/v keep the kv-head
-                # layout, flash-attn expands the groups internally
-                o = flash_attn_func(sq, sk, v, causal=False)
-                recurrent_state = None
+                if flash_attn_func is not None:
+                    # decode with GQA-native flash-attn: sk/v keep the kv-head
+                    # layout, flash-attn expands the groups internally
+                    o = flash_attn_func(sq, sk, v, causal=False)
+                    recurrent_state = None
+                else:
+                    # flash-attn unavailable: fall back to the naive
+                    # sliding-window chain (sk/v expanded to query heads)
+                    sk_hq = repeat_kv(sk.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    v_hq = repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    prefix_k = torch.zeros(k.size(0), self.num_slots, sk_hq.size(2), sk_hq.size(3), dtype=sk_hq.dtype, device=sk_hq.device)
+                    prefix_v = torch.zeros(k.size(0), self.num_slots, v_hq.size(2), v_hq.size(3), dtype=v_hq.dtype, device=v_hq.device)
+                    shift_k = torch.cat([prefix_k, sk_hq], dim=1)
+                    shift_v = torch.cat([prefix_v, v_hq], dim=1)
+                    sliding_window = self.naive_swa(sq, shift_k, self.window_size)
+                    sliding_window_prob = sliding_window.softmax(-1)
+                    o = torch.einsum('bthw,bwhd->bthd',
+                                    sliding_window_prob,
+                                    shift_v)
+                    recurrent_state = None
 
         if past_key_value is not None:
             past_key_value.update(
