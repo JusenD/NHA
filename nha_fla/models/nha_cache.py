@@ -102,15 +102,12 @@ class NHACache(transformers.cache_utils.Cache):
             if attn_state is not None:
                 key_state, value_state, f_state = state['attn_state']
                 if window_size is not None and key_state.shape[-2] == window_size:
-                    # DO NOT allocate new memory if the cache is full
-                    # roll the key/value states to the left by `input_size`
-                    key_state = key_state.roll(-input_size, -2)
-                    value_state = value_state.roll(-input_size, -2)
-                    f_state = f_state.roll(-input_size, -2)
-                    # replace the last `input_size` tokens with the new key/value states
-                    key_state[..., -input_size:, :] = attn_state[0]
-                    value_state[..., -input_size:, :] = attn_state[1]
-                    f_state[..., -input_size:, :] = attn_state[2]
+                    # shift the window left by `input_size` and append the new
+                    # key/value states (single cat kernel per tensor instead of
+                    # roll + slice-assign)
+                    key_state = torch.cat([key_state[..., input_size:, :], attn_state[0]], -2)
+                    value_state = torch.cat([value_state[..., input_size:, :], attn_state[1]], -2)
+                    f_state = torch.cat([f_state[..., input_size:, :], attn_state[2]], -2)
                     attn_state = (key_state, value_state, f_state)
                 else:
                     attn_state = (torch.cat([key_state, attn_state[0]], -2),
@@ -187,13 +184,11 @@ class NHACache(transformers.cache_utils.Cache):
             if attn_state is not None:
                 key_state, value_state = state['attn_state']
                 if window_size is not None and key_state.shape[-2] == window_size:
-                    # DO NOT allocate new memory if the cache is full
-                    # roll the key/value states to the left by `input_size`
-                    key_state = key_state.roll(-input_size, -2)
-                    value_state = value_state.roll(-input_size, -2)
-                    # replace the last `input_size` tokens with the new key/value states
-                    key_state[..., -input_size:, :] = attn_state[0]
-                    value_state[..., -input_size:, :] = attn_state[1]
+                    # shift the window left by `input_size` and append the new
+                    # key/value states (single cat kernel per tensor instead of
+                    # roll + slice-assign)
+                    key_state = torch.cat([key_state[..., input_size:, :], attn_state[0]], -2)
+                    value_state = torch.cat([value_state[..., input_size:, :], attn_state[1]], -2)
                     attn_state = (key_state, value_state)
                 else:
                     attn_state = (torch.cat([key_state, attn_state[0]], -2),
