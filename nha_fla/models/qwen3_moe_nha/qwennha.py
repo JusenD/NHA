@@ -189,6 +189,7 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
             and k.shape[1] == q.shape[1]
             and k.shape[2] == self.num_key_value_heads
             and (self.head_dim & (self.head_dim - 1)) == 0 and 16 <= self.head_dim <= 128
+            and (v.shape[-1] & (v.shape[-1] - 1)) == 0 and 16 <= v.shape[-1] <= 128
             and (self.num_slots & (self.num_slots - 1)) == 0 and 16 <= self.num_slots <= 128
         )
 

@@ -10,9 +10,13 @@
 # qv/swa_p slices, fp32 cumsum and per-chunk states at expanded head count)
 # never touch HBM.
 #
-# Numerics mirror the baseline kernel chain step for step (same bf16 rounding
-# points, fp32 accumulators, sub-chunk decay references and fast_expf) so the
-# output matches the pristine chunk_nha within bf16 noise.
+# Numerics track the baseline kernel chain within bf16 reassociation noise
+# (fp32 accumulators and gate cumsum, same exp, input-dtype rounding of the
+# score/probability operands before the tensor-core dots); the diagonal
+# sub-chunks use the baseline's row-referenced decay form so strong negative
+# gates cannot overflow fp32. Final states are bit-identical to the chain at
+# kv-head count, and the output is no less accurate than the chain against an
+# fp64 reference.
 
 from typing import Optional, Tuple
 
@@ -207,8 +211,15 @@ def chunk_nha_fused_o_kernel(
         b_ki = tl.load(p_ki, mask=m_ri[:, None] & m_k[None, :], other=0.)
         b_si = tl.load(p_si, mask=m_ri[:, None] & m_m[None, :], other=0.)
         b_Aii = tl.where(m_s, tl.dot(b_qs, tl.trans(b_ki)), 0.).to(b_ki.dtype)
-        b_vgi = (b_si * exp(b_gn[None, :] - b_gc)).to(b_si.dtype)
-        b_ok += tl.dot(b_Aii, b_vgi) * exp(b_gc - b_gn[None, :])
+        # row-referenced decay for the diagonal (the baseline inter kernel's
+        # scalar form): exp(gc_i - gc_j) <= 1 holds for valid pairs, whereas
+        # the gn-factored form overflows fp32 for strong negative gates
+        for j in tl.static_range(0, BC):
+            b_Aj = tl.sum(tl.where(o_c[None, :] == j, b_Aii.to(tl.float32), 0.), 1)
+            b_srow = tl.sum(tl.where(o_r[:, None] == j, b_si.to(tl.float32), 0.), 0)
+            b_grow = tl.sum(tl.where(o_r[:, None] == j, b_gc, 0.), 0)
+            b_vg = b_srow[None, :] * exp(b_gc - b_grow[None, :])
+            b_ok += tl.where(o_r[:, None] >= j, b_Aj[:, None] * b_vg, 0.)
 
         # ---- sliding-window scores (rotary)
         wrows = t0 - W + o_w
@@ -245,13 +256,23 @@ def chunk_nha_fused_o_kernel(
                 b_sj = tl.load(p_sj, mask=m_rj[:, None] & m_m[None, :], other=0.)
                 b_vj = tl.load(p_vj, mask=m_rj[:, None] & m_v[None, :], other=0.)
                 b_gcj = tl.load(p_gcj, mask=(rj[:, None] < T) & m_m[None, :], other=0.)
-                b_qg2 = b_qv * exp(b_gc - b_gn[None, :])
-                b_sg2 = b_sj * exp(b_gn[None, :] - b_gcj)
                 if i_j == i_i:
-                    b_Av = tl.where(m_s, tl.dot(b_qg2, tl.trans(b_sg2)), 0.).to(b_vj.dtype)
+                    # row-referenced decay for the diagonal (fp32 elementwise
+                    # A, as in the baseline intra kernel); the gn-factored dot
+                    # overflows fp32 for strong negative gates
+                    for j in tl.static_range(0, BC):
+                        b_srow2 = tl.sum(tl.where(o_r[:, None] == j, b_sj.to(tl.float32), 0.), 0)
+                        b_grow2 = tl.sum(tl.where(o_r[:, None] == j, b_gcj, 0.), 0)
+                        b_vrow2 = tl.sum(tl.where(o_r[:, None] == j, b_vj.to(tl.float32), 0.), 0)
+                        b_qg3 = b_qv.to(tl.float32) * exp(b_gc - b_grow2[None, :])
+                        b_Aj2 = tl.sum(b_qg3 * b_srow2[None, :], 1)
+                        b_Aj2 = tl.where(o_r >= j, b_Aj2, 0.)
+                        b_ov += b_Aj2[:, None] * b_vrow2[None, :]
                 else:
+                    b_qg2 = b_qv * exp(b_gc - b_gn[None, :])
+                    b_sg2 = b_sj * exp(b_gn[None, :] - b_gcj)
                     b_Av = tl.dot(b_qg2, tl.trans(b_sg2)).to(b_vj.dtype)
-                b_ov += tl.dot(b_Av, b_vj)
+                    b_ov += tl.dot(b_Av, b_vj)
 
         # ---- sliding-window output
         p_wv = v + ((i_b * T + wrows[:, None]) * H + i_h) * V + o_v[None, :]
@@ -309,6 +330,16 @@ def fused_chunk_nha_prefill(
     assert HQ % H == 0
     assert _pow2(K) and K <= 128 and _pow2(V) and V <= 128 and _pow2(M) and M <= 128
     assert 1 <= W <= 64
+    # the kernels index the inputs with raw pointer arithmetic that assumes
+    # dense [B, T, H, *] layouts; make that loud instead of silently
+    # misreading strided views (the baseline chain gets this via input_guard)
+    q, k, v, rotary_q, rotary_k, s, g = (x.contiguous() for x in (q, k, v, rotary_q, rotary_k, s, g))
+    if initial_state is not None:
+        hk0, hv0 = initial_state[0].contiguous(), initial_state[1].contiguous()
+        assert hk0.shape == (B, H, K, M) and hv0.shape == (B, H, M, V), \
+            f"initial_state must be at the kv-head count [B, {H}, ...], got {hk0.shape} / {hv0.shape}"
+    else:
+        hk0, hv0 = None, None
     if scale is None:
         scale = K ** -0.5
 
@@ -320,8 +351,6 @@ def fused_chunk_nha_prefill(
     BV = triton.next_power_of_2(V)
     BM = triton.next_power_of_2(M)
     BWK = triton.next_power_of_2(BC + W)
-
-    hk0, hv0 = (None, None) if initial_state is None else initial_state
 
     dtype = q.dtype
     hk = q.new_empty(B, NT, H, K, M, dtype=dtype)
