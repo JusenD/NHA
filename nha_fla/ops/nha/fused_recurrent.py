@@ -133,7 +133,8 @@ def fused_recurrent_nha_inference_k_kernel(
     M: tl.constexpr,
     MS: tl.constexpr,
     BK: tl.constexpr,
-    NG: tl.constexpr
+    NG: tl.constexpr,
+    OUTPUT_STATE: tl.constexpr
 ):
     i_bh = tl.program_id(0)
     i_bg = i_bh // NG
@@ -162,7 +163,7 @@ def fused_recurrent_nha_inference_k_kernel(
         b_hk = b_hk * b_g[:, None] + b_k[None, :] * b_s[:, None]
         b_ok += tl.sum(b_hk * b_q[None, :], axis=1)
 
-        if i_bh % NG == 0:
+        if OUTPUT_STATE and i_bh % NG == 0:
             p_hkt = hkt + i_bg * K * M + o_k[None, :] * M + o_m[:, None]
             tl.store(p_hkt, b_hk.to(p_hkt.dtype.element_ty), mask=mask_hk)
 
@@ -184,7 +185,8 @@ def fused_recurrent_nha_inference_v_kernel(
     M: tl.constexpr,
     MS: tl.constexpr,
     BV: tl.constexpr,
-    NG: tl.constexpr
+    NG: tl.constexpr,
+    OUTPUT_STATE: tl.constexpr
 ):
     i_bh = tl.program_id(0)
     i_bg = i_bh // NG
@@ -217,7 +219,7 @@ def fused_recurrent_nha_inference_v_kernel(
 
         tl.store(o + i_bh * V + o_v, b_ov.to(o.dtype.element_ty), mask=mask_v)
 
-        if i_bh % NG == 0:
+        if OUTPUT_STATE and i_bh % NG == 0:
             p_hvt = hvt + i_bg * M * V + o_m[None, :] * V + o_v[:, None]
             tl.store(p_hvt, b_hv.to(p_hvt.dtype.element_ty), mask=mask_hv)
 
@@ -270,7 +272,8 @@ def fused_recurrent_nha_inference(
         M=M,
         MS=MS,
         BK=BK,
-        NG=NG
+        NG=NG,
+        OUTPUT_STATE=output_final_state,
     )
 
     combined = torch.cat([ok, sliding_window], dim=-1)
@@ -294,7 +297,8 @@ def fused_recurrent_nha_inference(
         M=M,
         MS=MS,
         BV=BV,
-        NG=NG
+        NG=NG,
+        OUTPUT_STATE=output_final_state,
     )
 
     return o, swa_score, (hkt, hvt)
