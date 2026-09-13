@@ -11,6 +11,7 @@ from einops import rearrange
 
 from .configuration_qwen3_moe_nha import Qwen3MoeNHAConfig
 from nha_fla.ops.nha_naive import chunk_nha, fused_recurrent_nha, fused_recurrent_nha_decode
+from nha_fla.ops.nha.chunk_fused import fused_chunk_nha_prefill
 
 from nha_fla.models.nha_cache import NHACache
 
@@ -177,6 +178,20 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                 v = rearrange(v, '... (h d) -> ... h d', h=self.num_key_value_heads)
 
 
+        # The fused prefill consumes q/k/v/s/g in their kv-head layout and
+        # materializes no HBM intermediates; anything outside the gate falls
+        # back to the original chunk_nha chain.
+        use_fused_prefill = (
+            _FUSED_PREFILL_ENV
+            and not torch.is_grad_enabled()
+            and q.shape[1] > 1
+            and self.window_size <= 64
+            and k.shape[1] == q.shape[1]
+            and k.shape[2] == self.num_key_value_heads
+            and (self.head_dim & (self.head_dim - 1)) == 0 and 16 <= self.head_dim <= 128
+            and (self.num_slots & (self.num_slots - 1)) == 0 and 16 <= self.num_slots <= 128
+        )
+
         # Single-token decode applies rotary to the un-repeated kv heads:
         # rotary is identical across the heads of a GQA group, so rotating
         # before `repeat_kv` is equivalent and cheaper. The NHA (window <= 64)
@@ -222,10 +237,10 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                     "removed and `position_embeddings` will be mandatory."
                 )
                 cos, sin = self.rotary_emb(v, position_ids)
-                sq, sk = apply_rotary_pos_emb(q, k_rot, cos, sin, unsqueeze_dim=2)
+                sq, sk = apply_rotary_pos_emb(q, k if use_fused_prefill else k_rot, cos, sin, unsqueeze_dim=2)
             else:
                 cos, sin = position_embeddings
-                sq, sk = apply_rotary_pos_emb(q, k_rot, cos, sin, unsqueeze_dim=2)
+                sq, sk = apply_rotary_pos_emb(q, k if use_fused_prefill else k_rot, cos, sin, unsqueeze_dim=2)
 
         input_dtype = q.dtype
         if input_dtype == torch.float32:
@@ -256,55 +271,70 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
 
         if self.training or q.shape[1] > 1:
             if self.window_size <= 64:
-                rotary_q, rotary_k = sq, sk
-
-                prefix_k = torch.zeros(k.size(0), self.window_size, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
-                prefix_v = torch.zeros(v.size(0), self.window_size, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
-                prefix_s = torch.zeros(s.size(0), self.window_size, s.size(2), s.size(3), dtype=s.dtype, device=s.device)
-                prefix_g = torch.zeros(g.size(0), self.window_size, g.size(2), g.size(3), dtype=g.dtype, device=g.device)
-
-                shift_k = torch.cat([prefix_k, k], dim=1)
-                shift_v = torch.cat([prefix_v, v], dim=1)
-                shift_s = torch.cat([prefix_s, s], dim=1)
-                shift_g = torch.cat([prefix_g, g], dim=1)
-
-                prefix_k_rot = torch.zeros(k.size(0), self.window_size, rotary_k.size(2), rotary_k.size(3), dtype=rotary_k.dtype, device=rotary_k.device)
-                rotary_k = torch.cat([prefix_k_rot, rotary_k], dim=1)
-                chunk_k = repeat_kv(shift_k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                chunk_v = repeat_kv(shift_v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                chunk_s = repeat_kv(shift_s.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                chunk_g = repeat_kv(shift_g.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-
-                if recurrent_state is not None and recurrent_state[0].shape[1] == self.num_key_value_heads \
-                        and self.num_key_value_groups > 1:
-                    recurrent_state = (
-                        recurrent_state[0].repeat_interleave(self.num_key_value_groups, dim=1),
-                        recurrent_state[1].repeat_interleave(self.num_key_value_groups, dim=1),
+                if use_fused_prefill:
+                    o, recurrent_state = fused_chunk_nha_prefill(
+                        q=q,
+                        k=k,
+                        v=v,
+                        rotary_q=sq,
+                        rotary_k=sk,
+                        window_size=self.window_size,
+                        s=s,
+                        g=g,
+                        initial_state=recurrent_state,
+                        output_final_state=use_cache,
+                        scale=None,
                     )
+                else:
+                    rotary_q, rotary_k = sq, sk
 
-                o, recurrent_state = chunk_nha(
-                    q=q,
-                    k=chunk_k,
-                    v=chunk_v,
-                    rotary_q=rotary_q,
-                    rotary_k=rotary_k,
-                    window_size=self.window_size,
-                    s=chunk_s,
-                    g=chunk_g,
-                    initial_state=recurrent_state,
-                    output_final_state=use_cache,
-                    scale=None,
-                    head_first=False,
-                    rotary=None,
-                )
-                if use_cache and self.num_key_value_groups > 1:
-                    # chunk_nha tracks one state per (expanded) query head;
-                    # group members are bit-identical copies, so keep one
-                    # state per kv head for the decode op.
-                    recurrent_state = (
-                        recurrent_state[0][:, ::self.num_key_value_groups].contiguous(),
-                        recurrent_state[1][:, ::self.num_key_value_groups].contiguous(),
+                    prefix_k = torch.zeros(k.size(0), self.window_size, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
+                    prefix_v = torch.zeros(v.size(0), self.window_size, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
+                    prefix_s = torch.zeros(s.size(0), self.window_size, s.size(2), s.size(3), dtype=s.dtype, device=s.device)
+                    prefix_g = torch.zeros(g.size(0), self.window_size, g.size(2), g.size(3), dtype=g.dtype, device=g.device)
+
+                    shift_k = torch.cat([prefix_k, k], dim=1)
+                    shift_v = torch.cat([prefix_v, v], dim=1)
+                    shift_s = torch.cat([prefix_s, s], dim=1)
+                    shift_g = torch.cat([prefix_g, g], dim=1)
+
+                    prefix_k_rot = torch.zeros(k.size(0), self.window_size, rotary_k.size(2), rotary_k.size(3), dtype=rotary_k.dtype, device=rotary_k.device)
+                    rotary_k = torch.cat([prefix_k_rot, rotary_k], dim=1)
+                    chunk_k = repeat_kv(shift_k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_v = repeat_kv(shift_v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_s = repeat_kv(shift_s.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_g = repeat_kv(shift_g.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+
+                    if recurrent_state is not None and recurrent_state[0].shape[1] == self.num_key_value_heads \
+                            and self.num_key_value_groups > 1:
+                        recurrent_state = (
+                            recurrent_state[0].repeat_interleave(self.num_key_value_groups, dim=1),
+                            recurrent_state[1].repeat_interleave(self.num_key_value_groups, dim=1),
+                        )
+
+                    o, recurrent_state = chunk_nha(
+                        q=q,
+                        k=chunk_k,
+                        v=chunk_v,
+                        rotary_q=rotary_q,
+                        rotary_k=rotary_k,
+                        window_size=self.window_size,
+                        s=chunk_s,
+                        g=chunk_g,
+                        initial_state=recurrent_state,
+                        output_final_state=use_cache,
+                        scale=None,
+                        head_first=False,
+                        rotary=None,
                     )
+                    if use_cache and self.num_key_value_groups > 1:
+                        # chunk_nha tracks one state per (expanded) query head;
+                        # group members are bit-identical copies, so keep one
+                        # state per kv head for the decode op.
+                        recurrent_state = (
+                            recurrent_state[0][:, ::self.num_key_value_groups].contiguous(),
+                            recurrent_state[1][:, ::self.num_key_value_groups].contiguous(),
+                        )
             else:
                 rotary_q, rotary_k = sq, sk
                 v_hq = repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
