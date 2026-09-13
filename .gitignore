@@ -13,6 +13,9 @@ eval_results/
 # test file
 test.py
 
+# local credential files
+hf
+
 # data files
 data
 

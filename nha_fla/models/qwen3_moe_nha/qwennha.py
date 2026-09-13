@@ -158,8 +158,23 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
             if q.shape[1] == 1:
                 # inferece handle swa position
                 window_len = k.shape[1]
-                swa_pos = position_ids - torch.arange(window_len - 1, -1, -1, device=position_ids.device).unsqueeze(0)
-                cos, sin = self.rotary_emb(v.transpose(1, 2), swa_pos)
+                # All layers share the same rotary config and receive the same
+                # position_ids object within a forward pass, so the decode-time
+                # swa cos/sin are identical across layers. Memoize on the shared
+                # cache object keyed by the position_ids identity (exact reuse,
+                # no GPU sync, no approximation).
+                memo = getattr(past_key_value, '_swa_rope_memo', None) if past_key_value is not None else None
+                if memo is not None and memo[0] is position_ids and window_len in memo[1]:
+                    cos, sin = memo[1][window_len]
+                else:
+                    swa_pos = position_ids - torch.arange(window_len - 1, -1, -1, device=position_ids.device).unsqueeze(0)
+                    cos, sin = self.rotary_emb(v.transpose(1, 2), swa_pos)
+                    if past_key_value is not None:
+                        # holding a reference to position_ids keeps the identity
+                        # check exact (no id() reuse across steps)
+                        table = memo[1] if memo is not None and memo[0] is position_ids else {}
+                        table[window_len] = (cos, sin)
+                        past_key_value._swa_rope_memo = (position_ids, table)
                 sq, sk = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
                 sq = sq[:, -1:, ...]
             else:
@@ -233,24 +248,21 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                 o = o[:, self.num_slots:, :, :]
         else:
             if self.window_size <= 64:
-                sliding_window = self.naive_swa(sq, sk, self.window_size)
-                shift_k, shift_v, shift_g, shift_s = last_k, last_v, last_g, last_s
-
-                o, sliding_window_prob, recurrent_state = fused_recurrent_nha(
-                    q=q,
-                    k=shift_k,
-                    v=shift_v,
-                    sliding_window=sliding_window,
-                    s=shift_s,
-                    g=shift_g,
+                from nha_fla.ops.nha_naive.fused_recurrent import fused_recurrent_nha_decode
+                o, recurrent_state = fused_recurrent_nha_decode(
+                    q=q[:, 0],
+                    sq=sq[:, 0],
+                    k=last_k[:, 0],
+                    v=last_v[:, 0],
+                    s=last_s[:, 0],
+                    g=last_g[:, 0],
+                    sk=sk,
+                    vw=v,
                     initial_state=recurrent_state,
                     output_final_state=use_cache,
-                    # scale=scale,
-                    head_first=False
+                    scale=self.scaling,
                 )
-                o += torch.einsum('bthw,bwhd->bthd',
-                                    sliding_window_prob.to(v.dtype),
-                                    v)
+                o = o.unsqueeze(1)
             else:
                 prefix_k = torch.zeros(k.size(0), self.num_slots, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
                 prefix_v = torch.zeros(v.size(0), self.num_slots, v.size(2), v.size(3), dtype=v.dtype, device=v.device)

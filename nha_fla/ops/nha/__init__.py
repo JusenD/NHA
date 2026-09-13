@@ -5,6 +5,5 @@ from .fused_recurrent import fused_recurrent_nha
 
 __all__ = [
     'chunk_nha',
-    'chunk_nha_naive',
     'fused_recurrent_nha'
 ]

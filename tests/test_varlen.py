@@ -1,14 +1,18 @@
-import torch
 import random
+
+import torch
+
 from nha_fla.models.nha.configuration_nha import NHAConfig
 from nha_fla.models.nha.modeling_nha import NHAModel
+
 
 def check_nans_and_inf(tensor, name):
     assert not torch.isnan(tensor).any(), f"NaNs found in {name}"
     assert not torch.isinf(tensor).any(), f"Infs found in {name}"
 
+
 def test():
-    # 使用稍微大一点的模型参数增加计算压力
+    # slightly larger config to put real pressure on the kernels
     config = NHAConfig(
         hidden_size=512,
         num_hidden_layers=4,
@@ -32,19 +36,15 @@ def test():
             max_seqlen = max(seqlens)
             kwargs = {"input_ids": input_ids, "cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
 
-        # Clear grads
         model.zero_grad()
-        
-        # Fwd
+
         out = model(**kwargs)[0]
         check_nans_and_inf(out, f"{name} Output")
 
-        # Bwd
         loss = out.float().sum()
         check_nans_and_inf(loss, f"{name} Loss")
         loss.backward()
 
-        # Check gradients for NaNs
         has_grad = False
         grad_norm = 0.0
         for p in model.parameters():
@@ -52,26 +52,28 @@ def test():
                 has_grad = True
                 check_nans_and_inf(p.grad, f"{name} Gradients")
                 grad_norm += p.grad.norm().item()
-        
+
         assert has_grad, f"No gradients produced in {name}"
         print(f"{name} passed! Total seq len: {input_ids.shape[-1]}, Grad norm: {grad_norm:.4f}")
 
-    # 1. 简单的 Batch 测试
+    # plain batch mode
     run_tests("Normal Batch", [128] * 4, batch_mode=True)
 
-    # 2. 简单的 Varlen 测试
+    # plain varlen
     run_tests("Normal Varlen", [128, 64, 200, 10])
 
-    # 3. 压力测试: 含有非常长的序列
+    # stress: very long sequences
     run_tests("Stress Varlen - Long Seq", [4096, 2048, 1, 1024, 2])
 
-    # 4. 压力测试: 非常多的小序列 (相当于极限Batch Size)
+    # stress: many tiny sequences (extreme batch size)
+    random.seed(0)
     run_tests("Stress Varlen - Many Short", [random.randint(1, 100) for _ in range(256)])
-    
-    # 5. 压力测试: 极端混合长度分布
+
+    # stress: extreme mixed length distribution
     run_tests("Stress Varlen - Extreme Mixed", [1, 2000, 3, 50, 4, 3000, 2, 7])
 
-    print("\n✅ All stress tests passed successfully! 真的跑通了！")
+    print("All varlen stress tests passed.")
+
 
 if __name__ == "__main__":
     test()

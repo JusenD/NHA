@@ -247,6 +247,229 @@ def fused_recurrent_nha_inference(
     return o, swa_score, (hkt, hvt)
 
 
+@triton.jit
+def fused_recurrent_nha_decode_k_kernel(
+    q,
+    sq,
+    k,
+    s,
+    g,
+    sk,
+    hk0,
+    hkt,
+    qv,
+    swa_p,
+    scale,
+    W,
+    K: tl.constexpr,
+    M: tl.constexpr,
+    BK: tl.constexpr,
+    BW: tl.constexpr,
+    HQ: tl.constexpr,
+    NG: tl.constexpr,
+    OUTPUT_STATE: tl.constexpr
+):
+    # One program per (batch, query head).
+    # Computes the GSA slot scores b_ok and the sliding-window scores b_sw,
+    # then the combined softmax over [M | W] in registers, eliminating the
+    # cat + softmax + clone round-trips through global memory.
+    i_bh = tl.program_id(0)
+    i_bg = i_bh // NG
+    i_b = i_bh // HQ
+    i_hq = i_bh % HQ
+
+    b_s = tl.load(s + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    b_g = tl.load(g + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    b_g = exp(b_g)
+
+    o_w = tl.arange(0, BW)
+    m_w = o_w < W
+
+    b_ok = tl.zeros([M], dtype=tl.float32)
+    b_sw = tl.zeros([BW], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+
+        p_hk0 = hk0 + i_bg * K * M + (o_k[None, :]) * M + tl.arange(0, M)[:, None]
+        # [BK,]
+        mask_k = o_k < K
+        # [M, BK]
+        mask_hk = (tl.arange(0, M) < M)[:, None] & mask_k[None, :]
+        # [M, BK]
+        b_hk = tl.load(p_hk0, mask=mask_hk, other=0.).to(tl.float32)
+        # [BK,]
+        b_q = tl.load(q + i_bh * K + o_k, mask=mask_k, other=0.).to(tl.float32) * scale
+        b_k = tl.load(k + i_bg * K + o_k, mask=mask_k, other=0.).to(tl.float32)
+        b_hk = b_hk * b_g[:, None] + b_k[None, :] * b_s[:, None]
+        b_ok += tl.sum(b_hk * b_q[None, :], axis=1)
+
+        # sliding-window scores use the rope'd query/key
+        b_sq = tl.load(sq + i_bh * K + o_k, mask=mask_k, other=0.).to(tl.float32) * scale
+        # sk is [B, W, HQ, K]: element (i_b, w, i_hq, k)
+        p_sk = sk + ((i_b * W + o_w[:, None]) * HQ + i_hq) * K + o_k[None, :]
+        b_sk = tl.load(p_sk, mask=m_w[:, None] & mask_k[None, :], other=0.).to(tl.float32)
+        b_sw += tl.sum(b_sk * b_sq[None, :], axis=1)
+
+        if OUTPUT_STATE and i_bh % NG == 0:
+            p_hkt = hkt + i_bg * K * M + o_k[None, :] * M + tl.arange(0, M)[:, None]
+            tl.store(p_hkt, b_hk.to(p_hkt.dtype.element_ty), mask=mask_hk)
+
+    b_sw = tl.where(m_w, b_sw, float('-inf'))
+    b_max = tl.maximum(tl.max(b_ok, 0), tl.max(b_sw, 0))
+    b_eok = exp(b_ok - b_max)
+    b_esw = exp(b_sw - b_max)
+    b_den = tl.sum(b_eok, 0) + tl.sum(b_esw, 0)
+    b_qv = b_eok / b_den
+    b_swp = b_esw / b_den
+
+    tl.store(qv + i_bh * M + tl.arange(0, M), b_qv.to(qv.dtype.element_ty))
+    tl.store(swa_p + i_bh * BW + o_w, b_swp.to(swa_p.dtype.element_ty), mask=m_w)
+
+
+@triton.jit
+def fused_recurrent_nha_decode_v_kernel(
+    qv,
+    swa_p,
+    v,
+    s,
+    g,
+    vw,
+    o,
+    hv0,
+    hvt,
+    W,
+    V: tl.constexpr,
+    M: tl.constexpr,
+    BV: tl.constexpr,
+    BW: tl.constexpr,
+    HQ: tl.constexpr,
+    NG: tl.constexpr,
+    OUTPUT_STATE: tl.constexpr
+):
+    # One program per (batch, query head).
+    # o = hv_readout(qv) + swa_p @ vw, fused into a single store.
+    i_bh = tl.program_id(0)
+    i_bg = i_bh // NG
+    i_b = i_bh // HQ
+    i_hq = i_bh % HQ
+
+    b_s = tl.load(s + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    b_g = tl.load(g + i_bg * M + tl.arange(0, M)).to(tl.float32)
+    b_g = exp(b_g)
+
+    b_qv = tl.load(qv + i_bh * M + tl.arange(0, M)).to(tl.float32)
+
+    o_w = tl.arange(0, BW)
+    m_w = o_w < W
+    b_swp = tl.load(swa_p + i_bh * BW + o_w, mask=m_w, other=0.).to(tl.float32)
+
+    for i_v in range(tl.cdiv(V, BV)):
+        o_v = i_v * BV + tl.arange(0, BV)
+
+        p_hv0 = hv0 + i_bg * M * V + tl.arange(0, M)[None, :] * V + o_v[:, None]
+        # [BV,]
+        mask_v = o_v < V
+        # [BV, M]
+        mask_hv = mask_v[:, None] & (tl.arange(0, M) < M)[None, :]
+        # [BV, M]
+        b_hv = tl.load(p_hv0, mask=mask_hv, other=0).to(tl.float32)
+        # [BV,]
+        b_v = tl.load(v + i_bg * V + o_v, mask=mask_v, other=0).to(tl.float32)
+        b_hv = b_hv * b_g[None, :] + b_s[None, :] * b_v[:, None]
+        b_ov = tl.sum(b_hv * b_qv[None, :], axis=1)
+
+        # vw is [B, W, HQ, V]: element (i_b, w, i_hq, v)
+        p_vw = vw + ((i_b * W + o_w[:, None]) * HQ + i_hq) * V + o_v[None, :]
+        b_vw = tl.load(p_vw, mask=m_w[:, None] & mask_v[None, :], other=0.).to(tl.float32)
+        b_ov += tl.sum(b_vw * b_swp[:, None], axis=0)
+
+        tl.store(o + i_bh * V + o_v, b_ov.to(o.dtype.element_ty), mask=mask_v)
+
+        if OUTPUT_STATE and i_bh % NG == 0:
+            p_hvt = hvt + i_bg * M * V + tl.arange(0, M)[None, :] * V + o_v[:, None]
+            tl.store(p_hvt, b_hv.to(p_hvt.dtype.element_ty), mask=mask_hv)
+
+
+def fused_recurrent_nha_decode(
+    q: torch.Tensor,
+    sq: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    s: torch.Tensor,
+    g: torch.Tensor,
+    sk: torch.Tensor,
+    vw: torch.Tensor,
+    initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    output_final_state: bool = False,
+    scale: float = 1.,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Single-token fused NHA decode step.
+
+    Args:
+        q:  GSA query of shape `[B, HQ, K]` (no rope).
+        sq: SWA query of shape `[B, HQ, K]` (rope applied).
+        k, v, s, g: the key/value/slot/gate of the token popped from the
+            sliding window, shapes `[B, H, K]`, `[B, H, V]`, `[B, H, M]`, `[B, H, M]`.
+        sk: rope'd sliding-window keys of shape `[B, W, HQ, K]`, including the
+            current token. `W` may be smaller than the configured window while
+            the cache is warming up.
+        vw: sliding-window values of shape `[B, W, HQ, V]`.
+        initial_state: `(hk0, hv0)` of shapes `[B, H, K, M]` and `[B, H, M, V]`.
+        output_final_state: whether to return the updated states.
+        scale: attention scale applied to both GSA and SWA scores.
+
+    Returns:
+        o: `[B, HQ, V]` fused GSA + SWA output.
+        (hkt, hvt): updated states when `output_final_state` else `(None, None)`.
+    """
+    B, HQ, K = q.shape
+    H = k.shape[1]
+    V = v.shape[-1]
+    M = s.shape[-1]
+    W = sk.shape[1]
+    NG = HQ // H
+    BK = min(triton.next_power_of_2(K), 64)
+    BV = min(triton.next_power_of_2(V), 64)
+    BW = max(triton.next_power_of_2(W), 1)
+
+    q, sq, k, v, s, g, sk, vw = (
+        x.contiguous() for x in (q, sq, k, v, s, g, sk, vw)
+    )
+
+    if initial_state != (None, None) and initial_state is not None:
+        hk0, hv0 = initial_state
+    else:
+        hk0 = q.new_zeros(B, H, K, M, dtype=torch.float)
+        hv0 = q.new_zeros(B, H, M, V, dtype=torch.float)
+
+    hkt, hvt = None, None
+    if output_final_state:
+        if NG == 1:
+            hkt, hvt = hk0, hv0
+        else:
+            hkt = q.new_empty(B, H, K, M, dtype=torch.float)
+            hvt = q.new_empty(B, H, M, V, dtype=torch.float)
+
+    qv = q.new_empty(B, HQ, M, dtype=torch.float)
+    swa_p = q.new_empty(B, HQ, BW, dtype=torch.float)
+    grid = (B * HQ,)
+    fused_recurrent_nha_decode_k_kernel[grid](
+        q, sq, k, s, g, sk, hk0, hkt, qv, swa_p,
+        scale=scale,
+        K=K, M=M, BK=BK, W=W, BW=BW, HQ=HQ, NG=NG,
+        OUTPUT_STATE=output_final_state,
+    )
+
+    o = q.new_empty(B, HQ, V)
+    fused_recurrent_nha_decode_v_kernel[grid](
+        qv, swa_p, v, s, g, vw, o, hv0, hvt,
+        V=V, M=M, BV=BV, W=W, BW=BW, HQ=HQ, NG=NG,
+        OUTPUT_STATE=output_final_state,
+    )
+
+    return o, (hkt, hvt)
+
+
 def fused_recurrent_nha_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
