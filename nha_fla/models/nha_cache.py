@@ -97,34 +97,46 @@ class NHACache(transformers.cache_utils.Cache):
             self.states.append(state)
         else:
             state = self.states[layer_idx]
+            ret_attn_state = None
             if recurrent_state is not None:
                 state['recurrent_state'] = recurrent_state
             if attn_state is not None:
                 key_state, value_state, f_state = state['attn_state']
                 if window_size is not None and key_state.shape[-2] == window_size:
-                    # a chunk larger than the window replaces the whole
-                    # window; without this the cat below would grow the
-                    # cache past `window_size` and silently corrupt it
                     if input_size > window_size:
-                        attn_state = (attn_state[0][..., -window_size:, :].contiguous(),
-                                      attn_state[1][..., -window_size:, :].contiguous(),
-                                      attn_state[2][..., -window_size:, :].contiguous())
-                    # shift the window left by `input_size` and append the new
-                    # key/value states (single cat kernel per tensor instead of
-                    # roll + slice-assign)
-                    key_state = torch.cat([key_state[..., input_size:, :], attn_state[0]], -2)
-                    value_state = torch.cat([value_state[..., input_size:, :], attn_state[1]], -2)
-                    f_state = torch.cat([f_state[..., input_size:, :], attn_state[2]], -2)
-                    attn_state = (key_state, value_state, f_state)
+                        # a chunk larger than the window: storing the whole
+                        # cat would grow the cache past `window_size` and
+                        # silently corrupt the window invariant for later
+                        # pops/updates, so only the freshest tokens are
+                        # stored; the caller still consumes the full chunk
+                        # as its attention sequence
+                        state['attn_state'] = (
+                            attn_state[0][..., -window_size:, :].contiguous(),
+                            attn_state[1][..., -window_size:, :].contiguous(),
+                            attn_state[2][..., -window_size:, :].contiguous())
+                        ret_attn_state = attn_state
+                    else:
+                        # shift the window left by `input_size` and append the new
+                        # key/value states (single cat kernel per tensor instead of
+                        # roll + slice-assign)
+                        key_state = torch.cat([key_state[..., input_size:, :], attn_state[0]], -2)
+                        value_state = torch.cat([value_state[..., input_size:, :], attn_state[1]], -2)
+                        f_state = torch.cat([f_state[..., input_size:, :], attn_state[2]], -2)
+                        attn_state = (key_state, value_state, f_state)
+                        state['attn_state'] = attn_state
                 else:
                     attn_state = (torch.cat([key_state, attn_state[0]], -2),
                                   torch.cat([value_state, attn_state[1]], -2),
                                   torch.cat([f_state, attn_state[2]], -2),)
-                state['attn_state'] = attn_state
+                    state['attn_state'] = attn_state
             if conv_state is not None:
                 state['conv_state'] = conv_state
             if ffn_state is not None:
                 state['ffn_state'] = ffn_state
+            if ret_attn_state is not None:
+                ret = dict(state)
+                ret['attn_state'] = ret_attn_state
+                return ret
 
         return state
     
@@ -186,31 +198,43 @@ class NHACache(transformers.cache_utils.Cache):
             self.states.append(state)
         else:
             state = self.states[layer_idx]
+            ret_attn_state = None
             if recurrent_state is not None:
                 state['recurrent_state'] = recurrent_state
             if attn_state is not None:
                 key_state, value_state = state['attn_state']
                 if window_size is not None and key_state.shape[-2] == window_size:
-                    # a chunk larger than the window replaces the whole
-                    # window; without this the cat below would grow the
-                    # cache past `window_size` and silently corrupt it
                     if input_size > window_size:
-                        attn_state = (attn_state[0][..., -window_size:, :].contiguous(),
-                                      attn_state[1][..., -window_size:, :].contiguous())
-                    # shift the window left by `input_size` and append the new
-                    # key/value states (single cat kernel per tensor instead of
-                    # roll + slice-assign)
-                    key_state = torch.cat([key_state[..., input_size:, :], attn_state[0]], -2)
-                    value_state = torch.cat([value_state[..., input_size:, :], attn_state[1]], -2)
-                    attn_state = (key_state, value_state)
+                        # a chunk larger than the window: storing the whole
+                        # cat would grow the cache past `window_size` and
+                        # silently corrupt the window invariant for later
+                        # pops/updates, so only the freshest tokens are
+                        # stored; the caller still consumes the full chunk
+                        # as its attention sequence
+                        state['attn_state'] = (
+                            attn_state[0][..., -window_size:, :].contiguous(),
+                            attn_state[1][..., -window_size:, :].contiguous())
+                        ret_attn_state = attn_state
+                    else:
+                        # shift the window left by `input_size` and append the new
+                        # key/value states (single cat kernel per tensor instead of
+                        # roll + slice-assign)
+                        key_state = torch.cat([key_state[..., input_size:, :], attn_state[0]], -2)
+                        value_state = torch.cat([value_state[..., input_size:, :], attn_state[1]], -2)
+                        attn_state = (key_state, value_state)
+                        state['attn_state'] = attn_state
                 else:
                     attn_state = (torch.cat([key_state, attn_state[0]], -2),
                                   torch.cat([value_state, attn_state[1]], -2),)
-                state['attn_state'] = attn_state
+                    state['attn_state'] = attn_state
             if conv_state is not None:
                 state['conv_state'] = conv_state
             if ffn_state is not None:
                 state['ffn_state'] = ffn_state
+            if ret_attn_state is not None:
+                ret = dict(state)
+                ret['attn_state'] = ret_attn_state
+                return ret
 
         return state
 
