@@ -981,41 +981,34 @@ def fused_recurrent_nha(
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
+            Outputs of shape `[B, 1, H, V]`.
+        swa_score (torch.Tensor):
+            SWA-branch probabilities of the mixing softmax, shape `[B, 1, H, W]`.
         final_state (Tuple[torch.Tensor]):
-            Final state tuple having tensors of shape `[N, H, K, M]` and `[N, H, M, V]`.
+            Final state tuple `(hkt, hvt)` having tensors of shape `[N, H, K, M]`
+            and `[N, H, M, V]`, or `(None, None)` when
+            `output_final_state=False`.
+
+        This op is the single-token inference path: `T` must be 1 and the
+        query must not require grad.
 
     Examples::
         >>> import torch
         >>> import torch.nn.functional as F
-        >>> from einops import rearrange
         >>> from fla.ops.nha import fused_recurrent_nha
-        # inputs with equal lengths
-        >>> B, T, H, K, V, M = 4, 2048, 4, 512, 512, 64
-        >>> q = torch.randn(B, T, H, K, device='cuda')
-        >>> k = torch.randn(B, T, H, K, device='cuda')
-        >>> v = torch.randn(B, T, H, V, device='cuda')
-        >>> s = torch.randn(B, T, H, M, device='cuda')
-        >>> g = F.logsigmoid(torch.randn(B, T, H, M, device='cuda'))
+        >>> B, H, K, V, M, W = 4, 4, 512, 512, 64, 32
+        >>> q = torch.randn(B, 1, H, K, device='cuda')
+        >>> k = torch.randn(B, 1, H, K, device='cuda')
+        >>> v = torch.randn(B, 1, H, V, device='cuda')
+        >>> s = torch.randn(B, 1, H, M, device='cuda')
+        >>> g = F.logsigmoid(torch.randn(B, 1, H, M, device='cuda'))
+        >>> sw = torch.randn(B, 1, H, W, device='cuda')
         >>> h0 = (torch.randn(B, H, K, M, device='cuda'), torch.randn(B, H, M, V, device='cuda'))
-        >>> o, (hk, hv) = fused_recurrent_nha(
-            q, k, v, s, g,
+        >>> o, swa_score, (hk, hv) = fused_recurrent_nha(
+            q, k, v, sw, s, g,
             initial_state=h0,
             output_final_state=True
         )
-        # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
-        >>> q, k, v, s, g = map(lambda x: rearrange(x, 'b t h d -> 1 (b t) h d'), (q, k, v, s, g))
-        # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
-        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
-        >>> o_var, (hk_var, hv_var) = fused_recurrent_nha(
-            q, k, v, s, g,
-            initial_state=h0,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens
-        )
-        >>> assert o.allclose(o_var.view(o.shape))
-        >>> assert hk.allclose(hk_var)
-        >>> assert hv.allclose(hv_var)
     """
     if head_first:
         raise DeprecationWarning(
