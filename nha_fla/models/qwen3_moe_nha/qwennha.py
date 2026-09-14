@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .configuration_qwen3_moe_nha import Qwen3MoeNHAConfig
-from nha_fla.ops.nha_naive import chunk_nha, fused_recurrent_nha_decode
+from nha_fla.ops.nha import chunk_nha, fused_recurrent_nha_decode
 from nha_fla.ops.nha.chunk_fused import fused_chunk_nha_prefill
 
 from nha_fla.models.nha_cache import NHACache
@@ -292,22 +292,10 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                 else:
                     rotary_q, rotary_k = sq, sk
 
-                    prefix_k = torch.zeros(k.size(0), self.window_size, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
-                    prefix_v = torch.zeros(v.size(0), self.window_size, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
-                    prefix_s = torch.zeros(s.size(0), self.window_size, s.size(2), s.size(3), dtype=s.dtype, device=s.device)
-                    prefix_g = torch.zeros(g.size(0), self.window_size, g.size(2), g.size(3), dtype=g.dtype, device=g.device)
-
-                    shift_k = torch.cat([prefix_k, k], dim=1)
-                    shift_v = torch.cat([prefix_v, v], dim=1)
-                    shift_s = torch.cat([prefix_s, s], dim=1)
-                    shift_g = torch.cat([prefix_g, g], dim=1)
-
-                    prefix_k_rot = torch.zeros(k.size(0), self.window_size, rotary_k.size(2), rotary_k.size(3), dtype=rotary_k.dtype, device=rotary_k.device)
-                    rotary_k = torch.cat([prefix_k_rot, rotary_k], dim=1)
-                    chunk_k = repeat_kv(shift_k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    chunk_v = repeat_kv(shift_v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    chunk_s = repeat_kv(shift_s.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    chunk_g = repeat_kv(shift_g.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_k = repeat_kv(k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_v = repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_s = repeat_kv(s.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_g = repeat_kv(g.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
 
                     if recurrent_state is not None and recurrent_state[0].shape[1] == self.num_key_value_heads \
                             and self.num_key_value_groups > 1:
@@ -316,20 +304,20 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                             recurrent_state[1].repeat_interleave(self.num_key_value_groups, dim=1),
                         )
 
-                    o, recurrent_state = chunk_nha(
-                        q=q,
-                        k=chunk_k,
+                    o, _, _, recurrent_state = chunk_nha(
+                        q_swa=rotary_q,
+                        k_swa=rotary_k,
+                        q_gsa=q,
+                        k_gsa=chunk_k,
                         v=chunk_v,
-                        rotary_q=rotary_q,
-                        rotary_k=rotary_k,
-                        window_size=self.window_size,
                         s=chunk_s,
                         g=chunk_g,
+                        window_size_left=self.window_size - 1,
+                        window_size_right=0,
+                        gsa_kv_shift=self.window_size,
                         initial_state=recurrent_state,
                         output_final_state=use_cache,
                         scale=None,
-                        head_first=False,
-                        rotary=None,
                     )
                     if use_cache and self.num_key_value_groups > 1:
                         # chunk_nha tracks one state per (expanded) query head;

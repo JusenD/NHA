@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .configuration_llama3_nha import LlamaNHAConfig
-from nha_fla.ops.nha_naive import chunk_nha, fused_recurrent_nha
+from nha_fla.ops.nha import chunk_nha, fused_recurrent_nha
 
 from nha_fla.models.nha_cache import NHACache
 
@@ -183,32 +183,20 @@ class LlamaNativeHybridAttention(nn.Module):
             if self.window_size <= 64:
                 rotary_q, rotary_k = sq, sk
 
-                prefix_k = torch.zeros(k.size(0), self.window_size, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
-                prefix_v = torch.zeros(v.size(0), self.window_size, v.size(2), v.size(3), dtype=v.dtype, device=v.device)
-                prefix_s = torch.zeros(s.size(0), self.window_size, s.size(2), s.size(3), dtype=s.dtype, device=s.device)
-                prefix_g = torch.zeros(g.size(0), self.window_size, g.size(2), g.size(3), dtype=g.dtype, device=g.device)
-
-                shift_k = torch.cat([prefix_k, k], dim=1)
-                shift_v = torch.cat([prefix_v, v], dim=1)
-                shift_s = torch.cat([prefix_s, s], dim=1)
-                shift_g = torch.cat([prefix_g, g], dim=1)
-
-                rotary_k = torch.cat([prefix_k, rotary_k], dim=1)
-
-                o, recurrent_state = chunk_nha(
-                    q=q,
-                    k=shift_k,
-                    v=shift_v,
-                    rotary_q=rotary_q,
-                    rotary_k=rotary_k,
-                    window_size=self.window_size,
-                    s=shift_s,
-                    g=shift_g,
+                o, _, _, recurrent_state = chunk_nha(
+                    q_swa=rotary_q,
+                    k_swa=rotary_k,
+                    q_gsa=q,
+                    k_gsa=k,
+                    v=v,
+                    s=s,
+                    g=g,
+                    window_size_left=self.window_size - 1,
+                    window_size_right=0,
+                    gsa_kv_shift=self.window_size,
                     initial_state=recurrent_state,
                     output_final_state=use_cache,
                     scale=None,
-                    head_first=False,
-                    rotary=None,
                 )
             else:
                 rotary_q, rotary_k = sq, sk

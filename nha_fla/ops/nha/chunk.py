@@ -345,6 +345,9 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         window_size_right: int = -1,
         head_first: bool = False,
         gsa_kv_shift: int = 0,
+        hk0: torch.Tensor | None = None,
+        hv0: torch.Tensor | None = None,
+        output_final_state: bool = False,
     ):
         # Ensure contiguous
         q_swa = q_swa.contiguous()
@@ -380,6 +383,8 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
             s=s, g=g,
             scale=softmax_scale,
             cu_seqlens=cu_seqlens,
+            initial_state=(hk0, hv0),
+            output_final_state=output_final_state,
         )
 
         # Fix lse_gsa shape to match lse_swa: [T, H]
@@ -469,9 +474,10 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         # V is shared: accumulate gradients
         dv = dv_swa.add_(dv_gsa)
 
-        # Return grads for all 14 forward args (after ctx)
+        # Return grads for all 17 forward args (after ctx)
         return (dq_swa, dk_swa, dq_gsa, dk_gsa, dv, ds, dg,
-                None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None,
+                dhk0, dhv0, None)
 
 
 @torch.compiler.disable
@@ -490,7 +496,9 @@ def chunk_nha(
     window_size_right: int = -1,
     head_first: bool | None = False,
     gsa_kv_shift: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     r"""
     Chunk-level Native Hybrid Attention.
 
@@ -529,6 +537,12 @@ def chunk_nha(
             This argument has been deprecated.
         gsa_kv_shift (int):
             Shift GSA K/V right by this many positions. Default: ``0``.
+        initial_state (Optional[Tuple[torch.Tensor, torch.Tensor]]):
+            Initial GSA states ``(hk0, hv0)`` of shape ``[N, H, K, M]`` /
+            ``[N, H, M, V]`` (``N`` = batch size, or the number of sequences
+            in varlen mode). Default: ``None``.
+        output_final_state (bool):
+            Whether to return the final GSA states. Default: ``False``.
 
     Returns:
         o (torch.Tensor):
@@ -537,6 +551,10 @@ def chunk_nha(
             Log-sum-exp from SWA branch. Shape ``[B, T, H]``.
         lse_gsa (torch.Tensor):
             Log-sum-exp from GSA branch. Shape ``[B, T, H]``.
+        final_state (Tuple[torch.Tensor, torch.Tensor]):
+            ``(hkt, hvt)`` fp32 final GSA states ``[N, H, K, M]`` /
+            ``[N, H, M, V]``, returned (as a 4th element) only when
+            ``output_final_state=True``.
     """
     if head_first:
         raise DeprecationWarning(
@@ -551,12 +569,14 @@ def chunk_nha(
     assert q_swa.dim() == 4, "Expected [B, T, H, D] for input"
     B, T, H, D = q_swa.shape
     M = s.shape[-1]
-    
+
     if not is_varlen:
         # Batched mode: flatten to varlen
         # Build cu_seqlens
         cu_seqlens = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=q_swa.device)
         max_seqlen = T
+
+    hk0, hv0 = (None, None) if initial_state is None else initial_state
 
     q_swa = rearrange(q_swa, 'b t h d -> (b t) h d').contiguous()
     k_swa = rearrange(k_swa, 'b t h d -> (b t) h d').contiguous()
@@ -571,10 +591,15 @@ def chunk_nha(
         cu_seqlens, max_seqlen, scale,
         window_size_left, window_size_right,
         False, gsa_kv_shift,
+        hk0, hv0, output_final_state,
     )
-    
+
     # Reshape back to [B, T, H, D]
     output = rearrange(output, '(b t) h d -> b t h d', b=B, t=T)
     lse_swa = rearrange(lse_swa, '(b t) h -> b t h', b=B, t=T)
     lse_gsa = rearrange(lse_gsa, '(b t) h -> b t h', b=B, t=T)
+    # the final-state tuple is only returned when requested, keeping the
+    # long-standing 3-tuple return for existing callers
+    if output_final_state:
+        return output, lse_swa, lse_gsa, (hkt, hvt)
     return output, lse_swa, lse_gsa
