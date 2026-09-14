@@ -7,6 +7,7 @@
 </div>
 
 ## 🔥 News
+- [2026-09] 🚀 **Varlen & fast inference update**: NHA now supports variable-length training with arbitrary (random) sequence windows packed via `cu_seqlens`, plus fused inference kernels — ~1.3x faster decode and ~1.2x faster prefill.
 - [2026-04] 🎉 **NHA has been accepted to ACL 2026!**
 
 Welcome to NHA! This repository provides the implementation of [Native Hybrid Attention for Efficient Sequence Modeling](https://arxiv.org/abs/2510.07019). We include scripts for training, hybridization with pretrained LLMs, and evaluation.
