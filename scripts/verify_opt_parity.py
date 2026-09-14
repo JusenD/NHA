@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-# Parity harness for the NHA operator optimizations (opt-verify branch).
+# Parity verification script for the NHA operator optimizations (opt-verify
+# branch). Lives under scripts/ (it is a manual verification tool, not a unit
+# test); tests/ holds only test_varlen.py.
 #
 # Two modes:
 #   dump    --impl baseline|opt --out <dir>   run the suite, dump inputs+outputs
@@ -17,7 +19,9 @@
 #   * item 4 (in-kernel rotary / in-kernel s): tiny fp32-reassociation-level
 #     differences only.
 #   * item 6 (PDL): bit-exact on/off.
-#   * training path (chunk_nha fwd+bwd, varlen): untouched -> bit-exact.
+#   * training path (chunk_nha fwd+bwd, varlen): unchanged semantics; batched
+#     cases may differ from the naive-chain baseline by bf16 instantiation
+#     noise (batch-vs-varlen kernel selection), varlen stays bit-exact.
 
 import argparse
 import inspect
@@ -740,7 +744,6 @@ def compare(args):
                 worst = max(worst, ro64 if ro64 == ro64 else 1e9)
                 if eb:
                     rb64 = float('nan')
-                    verdict = 'opt OK; baseline cannot run (expected)' if 'NG' not in case else ''
                     verdict = 'opt OK; baseline N/A'
                 else:
                     rb64 = max(rel_l2(rb['outputs'][k2], ref[k2]) for k2 in ('o', 'hkt', 'hvt'))
