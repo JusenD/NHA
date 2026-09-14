@@ -14,7 +14,7 @@ from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
 from fla.modules.feature_map import ReLUFeatureMap, SwishFeatureMap, T2RFeatureMap
 from fla.modules.layernorm import rms_norm_linear
-from nha_fla.ops.nha import chunk_nha, fused_recurrent_nha
+from nha_fla.ops.nha import chunk_nha
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -169,7 +169,11 @@ class NativeHybridAttention(nn.Module):
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
 
         if q_len == 1 and last_state is not None:
-            mode = 'fused_recurrent'
+            raise NotImplementedError(
+                "Single-token decode for the NHA layer was removed: its only "
+                "implementation called the never-released fused_recurrent_nha_step. "
+                "Run the chunk path (prefill-style) instead."
+            )
         else:
             mode = self.mode
 
@@ -259,46 +263,6 @@ class NativeHybridAttention(nn.Module):
                     output, gsa_aux_loss = self._apply_gsa_aux_loss(output, lse_swa, lse_gsa)
                     self._store_gsa_aux_loss(gsa_aux_loss)
 
-        elif mode == 'fused_recurrent':
-            from nha_fla.ops.nha.fused_recurrent import fused_recurrent_nha_step
-
-            if recurrent_state is not None:
-                hk0, hv0 = recurrent_state
-            else:
-                H_kv = self.num_kv_heads * self.num_kv_groups
-                hk0 = q.new_zeros(batch_size, H_kv, self.head_k_dim, self.num_slots)
-                hv0 = q.new_zeros(batch_size, H_kv, self.num_slots, self.head_v_dim)
-
-            output_gsa, hk_new, hv_new = fused_recurrent_nha_step(
-                q=rearrange(q_gsa, 'b t h d -> (b t) h d'),
-                k=rearrange(k_gsa, 'b t h d -> (b t) h d'),
-                v=rearrange(v, 'b t h d -> (b t) h d'),
-                s=rearrange(s, 'b t h m -> (b t) h m'),
-                g=rearrange(g, 'b t h m -> (b t) h m'),
-                hk=hk0,
-                hv=hv0,
-                scale=self.scale,
-            )
-            output_gsa = rearrange(output_gsa, '(b t) h d -> b t h d', b=batch_size)
-
-            try:
-                from flash_attn import flash_attn_func
-                output_swa = flash_attn_func(
-                    q_swa, k_swa, v,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    window_size=(self.window_size, 0),
-                )
-            except ImportError:
-                scale = self.scale or self.head_k_dim ** -0.5
-                attn = torch.einsum('bthd,bshd->bths', q_swa * scale, k_swa)
-                causal_mask = torch.ones(q_len, q_len, dtype=torch.bool, device=attn.device).tril()
-                attn = attn.masked_fill(~causal_mask, float('-inf'))
-                attn = F.softmax(attn, dim=-1)
-                output_swa = torch.einsum('bths,bshd->bthd', attn, v)
-
-            output = 0.5 * output_swa + 0.5 * output_gsa
-            recurrent_state = (hk_new, hv_new)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 

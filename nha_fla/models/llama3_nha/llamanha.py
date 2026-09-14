@@ -228,8 +228,6 @@ class LlamaNativeHybridAttention(nn.Module):
                     g=shift_g,
                     initial_state=recurrent_state,
                     output_final_state=use_cache,
-                    # scale=scale,
-                    head_first=False
                 )
                 o += torch.einsum('bthw,bwhd->bthd',
                                     sliding_window_prob.to(v.dtype),
