@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2024, Songlin Yang, Yu Zhang
 
-import os
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
@@ -33,12 +32,11 @@ except Exception:  # flash-attn is only needed for the full-attention layers
 
 logger = logging.get_logger(__name__)
 
-# ablation switches (default on): NHA_FUSED_PREFILL=0 forces the original
-# chunk_nha prefill chain; NHA_DECODE_FUSED_ROTARY=0 keeps the eager rotary
-# plus the caller-computed slot residual on the decode path (bit-exact
-# against the pre-optimization layout).
-_FUSED_PREFILL_ENV = os.environ.get("NHA_FUSED_PREFILL", "1") != "0"
-_DECODE_FUSED_ROTARY_ENV = os.environ.get("NHA_DECODE_FUSED_ROTARY", "1") != "0"
+
+def _expand_kv(x: torch.Tensor, groups: int) -> torch.Tensor:
+    """Expand a kv-head-layout [B, T, H, D] tensor to the query-head count
+    (group-major order, transformers `repeat_kv` semantics)."""
+    return repeat_kv(x.transpose(1, 2), groups).transpose(1, 2)
 
 
 class Qwen3MoeNativeHybridAttention(nn.Module):
@@ -182,8 +180,7 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
         # materializes no HBM intermediates; anything outside the gate falls
         # back to the original chunk_nha chain.
         use_fused_prefill = (
-            _FUSED_PREFILL_ENV
-            and not torch.is_grad_enabled()
+            not torch.is_grad_enabled()
             and q.shape[1] > 1
             and self.window_size <= 64
             and k.shape[1] == q.shape[1]
@@ -219,7 +216,7 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                     table = memo[1] if memo is not None and memo[0] is position_ids else {}
                     table[window_len] = (cos, sin)
                     past_key_value._swa_rope_memo = (position_ids, table)
-            if self.window_size <= 64 and _DECODE_FUSED_ROTARY_ENV and cos.shape[-1] == k.shape[-1]:
+            if self.window_size <= 64 and cos.shape[-1] == k.shape[-1]:
                 # rotary folded into the fused decode kernel
                 sq, sk = None, k
             else:
@@ -231,7 +228,7 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
             # rotary targets: the kv-head keys for the fused prefill, the
             # query-head-expanded keys everywhere else; skip the expansion
             # entirely when only the fused path can consume it
-            k_rot = None if use_fused_prefill else repeat_kv(k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+            k_rot = None if use_fused_prefill else _expand_kv(k, self.num_key_value_groups)
 
             if position_embeddings is None:
                 logger.warning_once(
@@ -292,10 +289,10 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                 else:
                     rotary_q, rotary_k = sq, sk
 
-                    chunk_k = repeat_kv(k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    chunk_v = repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    chunk_s = repeat_kv(s.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    chunk_g = repeat_kv(g.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    chunk_k = _expand_kv(k, self.num_key_value_groups)
+                    chunk_v = _expand_kv(v, self.num_key_value_groups)
+                    chunk_s = _expand_kv(s, self.num_key_value_groups)
+                    chunk_g = _expand_kv(g, self.num_key_value_groups)
 
                     if recurrent_state is not None and recurrent_state[0].shape[1] == self.num_key_value_heads \
                             and self.num_key_value_groups > 1:
@@ -331,7 +328,7 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                         )
             else:
                 rotary_q, rotary_k = sq, sk
-                v_hq = repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                v_hq = _expand_kv(v, self.num_key_value_groups)
                 prefix_k = torch.zeros(k.size(0), self.num_slots, rotary_k.size(2), rotary_k.size(3), dtype=rotary_k.dtype, device=rotary_k.device)
                 prefix_v = torch.zeros(k.size(0), self.num_slots, v_hq.size(2), v_hq.size(3), dtype=v_hq.dtype, device=v_hq.device)
                 shift_q = torch.cat([prefix_k, rotary_q], dim=1)
@@ -375,8 +372,8 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                 else:
                     # flash-attn unavailable: fall back to the naive
                     # sliding-window chain (sk/v expanded to query heads)
-                    sk_hq = repeat_kv(sk.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
-                    v_hq = repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+                    sk_hq = _expand_kv(sk, self.num_key_value_groups)
+                    v_hq = _expand_kv(v, self.num_key_value_groups)
                     prefix_k = torch.zeros(k.size(0), self.num_slots, sk_hq.size(2), sk_hq.size(3), dtype=sk_hq.dtype, device=sk_hq.device)
                     prefix_v = torch.zeros(k.size(0), self.num_slots, v_hq.size(2), v_hq.size(3), dtype=v_hq.dtype, device=v_hq.device)
                     shift_k = torch.cat([prefix_k, sk_hq], dim=1)

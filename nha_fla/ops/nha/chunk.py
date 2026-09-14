@@ -431,9 +431,9 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         )
 
         # ---- Branch 2: GSA via chunk_gsa ----
-        # batched inputs stay in true batch mode: fla's varlen k-path is
-        # nondeterministic for >1 sequences on some stacks (see commit
-        # message), while the batch kernels are exact.
+        # batched inputs stay in true batch mode: fla 0.5.1's varlen k-path
+        # produces nondeterministic results for more than one sequence on
+        # some stacks, while the batch kernels are exact.
         output_gsa, lse_gsa, g_cum, hkt, hvt, saved_gsa, chunk_size = _chunk_gsa_fwd_wrapper(
             q_gsa, k_gsa, v_gsa,
             s=s, g=g,
