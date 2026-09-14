@@ -304,7 +304,7 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                             recurrent_state[1].repeat_interleave(self.num_key_value_groups, dim=1),
                         )
 
-                    o, _, _, recurrent_state = chunk_nha(
+                    _nha_out = chunk_nha(
                         q_swa=rotary_q,
                         k_swa=rotary_k,
                         q_gsa=q,
@@ -319,6 +319,8 @@ class Qwen3MoeNativeHybridAttention(nn.Module):
                         output_final_state=use_cache,
                         scale=None,
                     )
+                    o = _nha_out[0]
+                    recurrent_state = _nha_out[3] if use_cache else (None, None)
                     if use_cache and self.num_key_value_groups > 1:
                         # chunk_nha tracks one state per (expanded) query head;
                         # group members are bit-identical copies, so keep one

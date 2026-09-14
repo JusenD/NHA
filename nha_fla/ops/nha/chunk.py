@@ -97,6 +97,34 @@ def _packed_shift_right_backward(
     return grad_x
 
 
+def _batch_shift_right(
+    x: torch.Tensor,
+    shift: int,
+) -> torch.Tensor:
+    """Shift batched [B, T, H, D] tokens right by `shift` positions, zero-padded."""
+    if shift <= 0:
+        return x
+    B, T = x.shape[0], x.shape[1]
+    y = torch.zeros_like(x)
+    if T > shift:
+        y[:, shift:] = x[:, :T - shift]
+    return y
+
+
+def _batch_shift_right_backward(
+    grad_y: torch.Tensor,
+    shift: int,
+) -> torch.Tensor:
+    """Backward of _batch_shift_right."""
+    if shift <= 0:
+        return grad_y
+    B, T = grad_y.shape[0], grad_y.shape[1]
+    grad_x = torch.zeros_like(grad_y)
+    if T > shift:
+        grad_x[:, :T - shift] = grad_y[:, shift:]
+    return grad_x
+
+
 def _chunk_gsa_fwd_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -107,12 +135,16 @@ def _chunk_gsa_fwd_wrapper(
     cu_seqlens: torch.Tensor,
     initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     output_final_state: bool = False,
+    batched: bool = False,
 ) -> tuple:
     """Wrapper around chunk_gsa_fwd_with_lse with varlen convention.
 
-    Inputs are flat [T, H, D]; we unsqueeze batch dim for fla.
+    Inputs are flat [T, H, D] (or [B, T, H, D] when `batched`); we unsqueeze
+    the batch dim for fla in the flat case.
     """
-    q, k, v, s, g = (x.unsqueeze(0) for x in [q, k, v, s, g])
+    if not batched:
+        q, k, v, s, g = (x.unsqueeze(0) for x in [q, k, v, s, g])
+        assert cu_seqlens is not None
 
     if g is None:
         z = s.float().logcumsumexp(2)
@@ -122,20 +154,21 @@ def _chunk_gsa_fwd_wrapper(
     hk0, hv0 = (None, None) if initial_state is None else initial_state
     chunk_size = min(64, max(16, triton.next_power_of_2(q.shape[1])))
 
-    g_org, g = g, chunk_local_cumsum(g, chunk_size, cu_seqlens=cu_seqlens)
+    g_org, g = g, chunk_local_cumsum(g, chunk_size, cu_seqlens=None if batched else cu_seqlens)
 
     Ak, hk, hkt, ok, p, Av, hv, hvt, ov, lse = chunk_gsa_fwd_with_lse(
         q=q, k=k, v=v, s=s, g=g,
         initial_state=(hk0, hv0),
         output_final_state=output_final_state,
         scale=scale,
-        cu_seqlens=cu_seqlens.int(),
+        cu_seqlens=None if batched else cu_seqlens.int(),
         chunk_size=chunk_size,
     )
 
-    ov = ov.squeeze(0)
-    g = g.squeeze(0)
-    lse = lse.squeeze(0) if lse is not None else None
+    if not batched:
+        ov = ov.squeeze(0)
+        g = g.squeeze(0)
+        lse = lse.squeeze(0) if lse is not None else None
 
     return ov, lse, g, hkt, hvt, (ok, p, Av, hk0, hv0, hk, hv), chunk_size
 
@@ -145,21 +178,24 @@ def _chunk_gsa_bwd_wrapper(
     ok, p, A, h, initial_state,
     scale, do, dht, dlse,
     cu_seqlens, chunk_size,
+    batched: bool = False,
 ):
     """Wrapper around chunk_gsa_bwd_with_lse."""
-    q, k, v, s, g = (x.unsqueeze(0) for x in [q, k, v, s, g])
-    do = do.unsqueeze(0)
+    if not batched:
+        q, k, v, s, g = (x.unsqueeze(0) for x in [q, k, v, s, g])
+        do = do.unsqueeze(0)
 
     dq, dk, dv, ds, dg, dhk0, dhv0 = chunk_gsa_bwd_with_lse(
         q=q, k=k, v=v, s=s, g=g,
         ok=ok, p=p, A=A, h=h,
         initial_state=initial_state,
         scale=scale, do=do, dht=dht, dlse=dlse,
-        cu_seqlens=cu_seqlens.int(),
+        cu_seqlens=None if batched else cu_seqlens.int(),
         chunk_size=chunk_size,
     )
 
-    dq, dk, dv, ds, dg = (x.squeeze(0) for x in [dq, dk, dv, ds, dg])
+    if not batched:
+        dq, dk, dv, ds, dg = (x.squeeze(0) for x in [dq, dk, dv, ds, dg])
     return dq, dk, dv, ds, dg, dhk0, dhv0
 
 
@@ -348,6 +384,8 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         hk0: torch.Tensor | None = None,
         hv0: torch.Tensor | None = None,
         output_final_state: bool = False,
+        input_is_varlen: bool = True,
+        batch_size: int = 1,
     ):
         # Ensure contiguous
         q_swa = q_swa.contiguous()
@@ -361,10 +399,25 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
 
         # Optional: shift GSA KV to focus on older context
         if gsa_kv_shift > 0:
-            k_gsa = _packed_shift_right(k_gsa, cu_seqlens, gsa_kv_shift)
-            v_gsa = _packed_shift_right(v_gsa, cu_seqlens, gsa_kv_shift)
-            s = _packed_shift_right(s, cu_seqlens, gsa_kv_shift)
-            g = _packed_shift_right(g, cu_seqlens, gsa_kv_shift)
+            if input_is_varlen:
+                k_gsa = _packed_shift_right(k_gsa, cu_seqlens, gsa_kv_shift)
+                v_gsa = _packed_shift_right(v_gsa, cu_seqlens, gsa_kv_shift)
+                s = _packed_shift_right(s, cu_seqlens, gsa_kv_shift)
+                g = _packed_shift_right(g, cu_seqlens, gsa_kv_shift)
+            else:
+                T_batch = max_seqlen
+                q_gsa = rearrange(q_gsa, '(b t) h d -> b t h d', b=batch_size, t=T_batch).contiguous()
+                k_gsa = _batch_shift_right(rearrange(k_gsa, '(b t) h d -> b t h d', b=batch_size, t=T_batch).contiguous(), gsa_kv_shift)
+                v_gsa = _batch_shift_right(rearrange(v_gsa, '(b t) h d -> b t h d', b=batch_size, t=T_batch).contiguous(), gsa_kv_shift)
+                s = _batch_shift_right(rearrange(s, '(b t) h m -> b t h m', b=batch_size, t=T_batch).contiguous(), gsa_kv_shift)
+                g = _batch_shift_right(rearrange(g, '(b t) h m -> b t h m', b=batch_size, t=T_batch).contiguous(), gsa_kv_shift)
+        elif not input_is_varlen:
+            T_batch = max_seqlen
+            q_gsa = rearrange(q_gsa, '(b t) h d -> b t h d', b=batch_size, t=T_batch).contiguous()
+            k_gsa = rearrange(k_gsa, '(b t) h d -> b t h d', b=batch_size, t=T_batch).contiguous()
+            v_gsa = rearrange(v_gsa, '(b t) h d -> b t h d', b=batch_size, t=T_batch).contiguous()
+            s = rearrange(s, '(b t) h m -> b t h m', b=batch_size, t=T_batch).contiguous()
+            g = rearrange(g, '(b t) h m -> b t h m', b=batch_size, t=T_batch).contiguous()
 
         # ---- Branch 1: SWA via flash_attn ----
         output_swa, lse_swa = _flash_attn_fwd_wrapper(
@@ -378,6 +431,9 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         )
 
         # ---- Branch 2: GSA via chunk_gsa ----
+        # batched inputs stay in true batch mode: fla's varlen k-path is
+        # nondeterministic for >1 sequences on some stacks (see commit
+        # message), while the batch kernels are exact.
         output_gsa, lse_gsa, g_cum, hkt, hvt, saved_gsa, chunk_size = _chunk_gsa_fwd_wrapper(
             q_gsa, k_gsa, v_gsa,
             s=s, g=g,
@@ -385,10 +441,16 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             initial_state=(hk0, hv0),
             output_final_state=output_final_state,
+            batched=not input_is_varlen,
         )
+        if not input_is_varlen:
+            T_batch = max_seqlen
+            output_gsa = rearrange(output_gsa, 'b t h d -> (b t) h d', b=batch_size, t=T_batch).contiguous()
 
         # Fix lse_gsa shape to match lse_swa: [T, H]
-        if lse_gsa.shape[0] == q_swa.shape[1]:  # [H, T] -> [T, H]
+        if not input_is_varlen:
+            lse_gsa = rearrange(lse_gsa, 'b t h -> (b t) h', b=batch_size, t=T_batch).contiguous()
+        elif lse_gsa.shape[0] == q_swa.shape[1]:  # [H, T] -> [T, H]
             lse_gsa = lse_gsa.t().contiguous()
         else:
             lse_gsa = lse_gsa.contiguous()
@@ -420,6 +482,8 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         ctx.window_size_right = window_size_right
         ctx.chunk_size = chunk_size
         ctx.gsa_kv_shift = gsa_kv_shift
+        ctx.input_is_varlen = input_is_varlen
+        ctx.batch_size = batch_size
 
         return output, lse_swa, lse_gsa, hkt, hvt
 
@@ -454,6 +518,11 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
         if d_lse_gsa is not None:
             dlse_fusion = dlse_fusion + d_lse_gsa
 
+        if not ctx.input_is_varlen:
+            T_batch = ctx.max_seqlen
+            dov = rearrange(dov, '(b t) h d -> b t h d', b=ctx.batch_size, t=T_batch).contiguous()
+            dlse_fusion = rearrange(dlse_fusion, '(b t) h -> b t h', b=ctx.batch_size, t=T_batch).contiguous()
+
         dq_gsa, dk_gsa, dv_gsa, ds, dg, dhk0, dhv0 = _chunk_gsa_bwd_wrapper(
             q=q_gsa, k=k_gsa, v=v_gsa, s=s, g=g_cum,
             ok=ok, p=p, A=(None, Av), h=(hk, hv),
@@ -462,22 +531,37 @@ class ChunkNativeHybridAttentionFunction(torch.autograd.Function):
             do=dov, dht=(dhkt, dhvt), dlse=dlse_fusion,
             cu_seqlens=cu_seqlens,
             chunk_size=ctx.chunk_size,
+            batched=not ctx.input_is_varlen,
         )
 
         # Undo shift in backward
         if ctx.gsa_kv_shift > 0:
-            dk_gsa = _packed_shift_right_backward(dk_gsa, cu_seqlens, ctx.gsa_kv_shift)
-            dv_gsa = _packed_shift_right_backward(dv_gsa, cu_seqlens, ctx.gsa_kv_shift)
-            ds = _packed_shift_right_backward(ds, cu_seqlens, ctx.gsa_kv_shift)
-            dg = _packed_shift_right_backward(dg, cu_seqlens, ctx.gsa_kv_shift)
+            if ctx.input_is_varlen:
+                dk_gsa = _packed_shift_right_backward(dk_gsa, cu_seqlens, ctx.gsa_kv_shift)
+                dv_gsa = _packed_shift_right_backward(dv_gsa, cu_seqlens, ctx.gsa_kv_shift)
+                ds = _packed_shift_right_backward(ds, cu_seqlens, ctx.gsa_kv_shift)
+                dg = _packed_shift_right_backward(dg, cu_seqlens, ctx.gsa_kv_shift)
+            else:
+                dk_gsa = _batch_shift_right_backward(dk_gsa, ctx.gsa_kv_shift)
+                dv_gsa = _batch_shift_right_backward(dv_gsa, ctx.gsa_kv_shift)
+                ds = _batch_shift_right_backward(ds, ctx.gsa_kv_shift)
+                dg = _batch_shift_right_backward(dg, ctx.gsa_kv_shift)
+
+        if not ctx.input_is_varlen:
+            T_batch = ctx.max_seqlen
+            dq_gsa = rearrange(dq_gsa, 'b t h d -> (b t) h d', b=ctx.batch_size, t=T_batch).contiguous()
+            dk_gsa = rearrange(dk_gsa, 'b t h d -> (b t) h d', b=ctx.batch_size, t=T_batch).contiguous()
+            dv_gsa = rearrange(dv_gsa, 'b t h d -> (b t) h d', b=ctx.batch_size, t=T_batch).contiguous()
+            ds = rearrange(ds, 'b t h m -> (b t) h m', b=ctx.batch_size, t=T_batch).contiguous()
+            dg = rearrange(dg, 'b t h m -> (b t) h m', b=ctx.batch_size, t=T_batch).contiguous()
 
         # V is shared: accumulate gradients
         dv = dv_swa.add_(dv_gsa)
 
-        # Return grads for all 17 forward args (after ctx)
+        # Return grads for all 19 forward args (after ctx)
         return (dq_swa, dk_swa, dq_gsa, dk_gsa, dv, ds, dg,
                 None, None, None, None, None, None, None,
-                dhk0, dhv0, None)
+                dhk0, dhv0, None, None, None)
 
 
 @torch.compiler.disable
@@ -592,6 +676,7 @@ def chunk_nha(
         window_size_left, window_size_right,
         False, gsa_kv_shift,
         hk0, hv0, output_final_state,
+        is_varlen, B,
     )
 
     # Reshape back to [B, T, H, D]

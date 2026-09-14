@@ -183,7 +183,7 @@ class LlamaNativeHybridAttention(nn.Module):
             if self.window_size <= 64:
                 rotary_q, rotary_k = sq, sk
 
-                o, _, _, recurrent_state = chunk_nha(
+                _nha_out = chunk_nha(
                     q_swa=rotary_q,
                     k_swa=rotary_k,
                     q_gsa=q,
@@ -198,6 +198,8 @@ class LlamaNativeHybridAttention(nn.Module):
                     output_final_state=use_cache,
                     scale=None,
                 )
+                o = _nha_out[0]
+                recurrent_state = _nha_out[3] if use_cache else (None, None)
             else:
                 rotary_q, rotary_k = sq, sk
                 prefix_k = torch.zeros(k.size(0), self.num_slots, k.size(2), k.size(3), dtype=k.dtype, device=k.device)
