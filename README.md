@@ -109,11 +109,12 @@ For recall-intensive tasks, we recommend using the [prefix-linear-attention](htt
 ## 📜 Citation
 If you find this repo useful, please consider citing our paper:
 ```bibtex
-@article{du2025native,
-  title={Native Hybrid Attention for Efficient Sequence Modeling},
+@inproceedings{du2026native,
+  title={Native hybrid attention for efficient sequence modeling},
   author={Du, Jusen and Hu, Jiaxi and Zhang, Tao and Sun, Weigao and Cheng, Yu},
-  journal={arXiv preprint arXiv:2510.07019},
-  year={2025}
+  booktitle={Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  pages={3826--3842},
+  year={2026}
 }
 ```
 
