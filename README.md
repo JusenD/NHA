@@ -106,6 +106,17 @@ accelerate launch --multi_gpu evals/harness.py --model hf \
 
 For recall-intensive tasks, we recommend using the [prefix-linear-attention](https://github.com/HazyResearch/prefix-linear-attention) repository.
 
+## 📜 Citation
+If you find this repo useful, please consider citing our paper:
+```bibtex
+@article{du2025native,
+  title={Native Hybrid Attention for Efficient Sequence Modeling},
+  author={Du, Jusen and Hu, Jiaxi and Zhang, Tao and Sun, Weigao and Cheng, Yu},
+  journal={arXiv preprint arXiv:2510.07019},
+  year={2025}
+}
+```
+
 ## ⭐ Acknowledgements
 
 This repository is built upon [flash-linear-attention](https://github.com/fla-org/flash-linear-attention). The evaluation is supported by [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) and [prefix-linear-attention](https://github.com/HazyResearch/prefix-linear-attention). Thank sincerely for their contribution!
